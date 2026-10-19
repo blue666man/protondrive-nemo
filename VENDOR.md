@@ -45,6 +45,15 @@ Changes from upstream, all mechanical (no logic changes):
   session doesn't collide with the official CLI's if both are installed.
 - Dropped `credentials/passCredentialsStore.ts` (pass(1) support) and the
   CLI's own command/REPL/telemetry layers — out of scope for a FUSE daemon.
+- `api/serverTimeHook.ts`: added straight from upstream commit
+  `8a44654aece1609f0f7218be51c205103945abd8` (`cli/src/api/serverTimeHook.ts`,
+  landed after the commit pinned above). No source changes — it has no
+  Bun-specific APIs. Keeps `@protontech/crypto`'s notion of server time in
+  sync with the API's `x-pm-date`/`date` response headers, so a device clock
+  running ahead of Proton's servers doesn't produce future-dated keys and
+  signatures that the API rejects. Wired into `api/index.ts`'s
+  `afterResponseHooks`, ahead of `createDriveRequirementAfterResponseHook`,
+  same as upstream.
 
 This module is not a general-purpose library; it's this project's own
 adapted copy of Proton's reference wiring, kept in its own directory so the

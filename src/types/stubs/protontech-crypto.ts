@@ -55,3 +55,5 @@ export declare const CryptoProxy: {
     exportPrivateKey(options: ExportPrivateKeyOptions): Promise<string>;
     importPrivateKey(options: ImportPrivateKeyOptions): Promise<PrivateKeyReference>;
 };
+
+export declare function updateServerTime(newServerTime: Date, serverTimeUpdatedAt?: Date): Date;
