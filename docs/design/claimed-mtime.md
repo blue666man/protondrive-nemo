@@ -4,7 +4,7 @@ Status: proposal
 
 ## Goal
 
-Make the mount behave like a normal filesystem for `rsync -a` and `cp -p`, in both
+Make the mount behave like a normal filesystem for `rsync -rlt` and `cp -p`, in both
 directions:
 
 - a file copied onto the mount keeps its own modification time, and Proton's apps show
@@ -122,6 +122,7 @@ what gets uploaded. This generalises the existing 500 ms grace window for empty 
 |---|---|
 | `release` of a dirty file | ack now; pending; settle timer 2 s (`PROTONDRIVE_NEMO_SETTLE_MS`) |
 | `utimens` while pending or open | `fs.utimes(localPath)`; restart the timer |
+| `chmod` / `chown` | Fail with `EPERM`: Drive has no modes or owners, and a silent no-op would mislead. Sync with `rsync -rlt` |
 | `utimens` on a committed node | accept, ignore |
 | `rename` of a pending new file | retarget in memory, no server call |
 | ↳ dest is an existing Drive file | becomes a **pending revision of dest** (keeps history; no Trash copy) |
@@ -139,8 +140,11 @@ Notes:
   revision of a different size would otherwise be overwritten by a fresh download.
 - `evict` must refuse a pending path, just as it refuses a path with unsaved changes
   today (`src/ipcServer.ts:120-123`).
-- `chmod` and `chown` are accepted as no-ops. Drive has no POSIX modes or owners, and
-  failing them makes `rsync -a` exit 23.
+- `chmod` and `chown` fail with `EPERM`. Drive has no POSIX modes or owners, and
+  pretending to apply them would hide that from the caller. `EPERM` (rather than
+  today's `ENOSYS`) states the refusal is deliberate, and `cp -p` already tolerates
+  `EPERM` from `chown`. Consequence: sync with `rsync -rlt` (or `-a --no-perms
+  --no-owner --no-group`); plain `rsync -a` still exits 23 on the permission step.
 - For folders, the claimed time can only be set by `createFolder`, which happens at
   `mkdir` (`src/fuseOps.ts:413`), before rsync knows the time. A later `utimens` on a
   folder is accepted and ignored, like any committed node.
@@ -216,7 +220,8 @@ All three tiers are part of the change. The repository has no tests today.
 **Tier 2: real kernel FUSE with FakeDrive** (`test/mount`, `npm run test:mount`):
 
 - needs `/dev/fuse` and the native modules;
-- runs real `rsync -a` twice (the second run uploads nothing), `cp -p`, `touch -d`, `mv`
+- runs real `rsync -rlt` twice (the second run uploads nothing), `rsync -a` (asserting
+  only the expected permission errors), `cp -p`, `touch -d`, `mv`
   across folders and an editor-style save;
 - asserts one upload per file, the right name and the right claimed time.
 
@@ -224,9 +229,9 @@ All three tiers are part of the change. The repository has no tests today.
 never in CI):
 
 - works in a throwaway Drive folder created for the run and removed at the end;
-- lifecycle (a): a local file with an old mtime → `rsync -a` onto the mount → the Drive
+- lifecycle (a): a local file with an old mtime → `rsync -rlt` onto the mount → the Drive
   web app shows the old time;
-- lifecycle (b): a file created in the web app → `rsync -a` off the mount keeps its
+- lifecycle (b): a file created in the web app → `rsync -rlt` off the mount keeps its
   time;
 - times persist across a remount;
 - killing the daemon inside the settle window, then remounting, replays the upload.
@@ -242,7 +247,7 @@ tests never load, so its native build is not needed to run them.
 | Topic | Decision |
 |---|---|
 | mtime write strategy | Settle window, 2 s by default (`PROTONDRIVE_NEMO_SETTLE_MS`) |
-| `utimens` on a committed node | Accept and ignore. An error would make `rsync -a` exit 23 for every directory, and the SDK cannot change a claimed time without a new revision |
+| `utimens` on a committed node | Accept and ignore. An error would make `rsync -t` exit 23 for every directory, and the SDK cannot change a claimed time without a new revision |
 | Upload concurrency | None in the driver; the SDK queue already limits files, bytes in flight and blocks, and handles 429s |
 | Testing | All three tiers |
 
