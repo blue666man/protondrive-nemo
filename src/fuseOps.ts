@@ -5,6 +5,7 @@ import Fuse from '@cocalc/fuse-native';
 import { MemberRole, NodeType } from '@protontech/drive-sdk';
 import type { Logger, NodeEntity, ProtonDriveClient } from '@protontech/drive-sdk';
 
+import type { CachePolicy } from './cachePolicy';
 import { ContentStore } from './contentStore';
 import { DriveTree, NodeNotFoundError } from './driveTree';
 
@@ -15,6 +16,8 @@ interface OpenFile {
     handle: FileHandle;
     dirty: boolean;
     isNewFile: boolean;
+    /** True when the policy says this file's content must not persist locally; removed when the last handle closes. */
+    ephemeral: boolean;
     parentUid: string;
     name: string;
 }
@@ -107,6 +110,7 @@ export function createFuseOperations(
     sdk: ProtonDriveClient,
     tree: DriveTree,
     content: ContentStore,
+    policy: CachePolicy,
     logger: Logger,
 ): FuseOperationsHandle {
     const openFiles = new Map<number, OpenFile>();
@@ -154,6 +158,26 @@ export function createFuseOperations(
         if (rep && rep.node.uid === state.node.uid) {
             openFilesByPath.delete(path);
         }
+    }
+
+    /**
+     * Removes a non-cacheable file's throwaway copy, but only once no other
+     * handle (or pending create) still points at the same local file — the
+     * kernel can have several fds open on one path.
+     */
+    async function evictIfUnused(file: OpenFile): Promise<void> {
+        for (const other of openFiles.values()) {
+            if (other.localPath === file.localPath) {
+                return;
+            }
+        }
+        const pending = newFileStates.get(file.path);
+        if (pending && pending.localPath === file.localPath) {
+            return;
+        }
+        await content
+            .forget(file.node.uid)
+            .catch((err) => logger.warn(`Failed to remove cached copy of ${file.name}: ${err}`));
     }
 
     const ops: Fuse.OPERATIONS = {
@@ -208,6 +232,7 @@ export function createFuseOperations(
                 openLocal(path, state.node, state.localPath, {
                     dirty: false,
                     isNewFile: true,
+                    ephemeral: false,
                     parentUid: state.parentUid,
                     name: state.name,
                 })
@@ -218,11 +243,13 @@ export function createFuseOperations(
             tree
                 .resolve(path)
                 .then(async (node) => {
-                    const localPath = await content.ensureDownloaded(node);
+                    const ephemeral = !policy.isCacheable(path);
+                    const localPath = await content.ensureDownloaded(node, { ephemeral });
                     const { parent, name } = await tree.resolveParent(path);
                     const fd = await openLocal(path, node, localPath, {
                         dirty: false,
                         isNewFile: false,
+                        ephemeral,
                         parentUid: parent.uid,
                         name,
                     });
@@ -236,7 +263,9 @@ export function createFuseOperations(
                 .resolveParent(path)
                 .then(async ({ parent, name }) => {
                     const node = placeholderNode(path, name);
-                    const localPath = await content.createEmptyLocal(node.uid);
+                    const localPath = await content.createEmptyLocal(node.uid, {
+                        ephemeral: !policy.isCacheable(path),
+                    });
                     const state: NewFileState = {
                         parentUid: parent.uid,
                         name,
@@ -250,6 +279,7 @@ export function createFuseOperations(
                     const fd = await openLocal(path, node, localPath, {
                         dirty: false,
                         isNewFile: true,
+                        ephemeral: false,
                         parentUid: parent.uid,
                         name,
                     });
@@ -324,7 +354,7 @@ export function createFuseOperations(
             }
             tree
                 .resolve(path)
-                .then((node) => content.ensureDownloaded(node))
+                .then((node) => content.ensureDownloaded(node, { ephemeral: !policy.isCacheable(path) }))
                 .then((localPath) => fsTruncate(localPath, size))
                 .then(() => cb(0))
                 .catch((err) => cb(errnoFor(err)));
@@ -354,18 +384,23 @@ export function createFuseOperations(
                             openFilesByPath.delete(file.path);
                         }
 
-                        if (!file.dirty) {
-                            cb(0);
-                            return;
-                        }
                         try {
-                            await content.uploadRevision(file.node, file.localPath);
-                            tree.invalidate(file.parentUid);
-                            cb(0);
+                            if (file.dirty) {
+                                await content.uploadRevision(file.node, file.localPath);
+                                tree.invalidate(file.parentUid);
+                            }
                         } catch (err) {
                             logger.error(`Failed to upload ${file.name} on release`, err);
                             cb(errnoFor(err));
+                            return;
                         }
+                        // A non-cacheable file (outside the allowlist, or
+                        // ephemeral mode) only needs its decrypted copy while
+                        // it is open; drop it now that the last handle closed.
+                        if (file.ephemeral) {
+                            await evictIfUnused(file);
+                        }
+                        cb(0);
                         return;
                     }
 

@@ -216,6 +216,27 @@ This shows up two ways, since neither is complete on its own:
 nemo -q                                    # restart Nemo to pick it up
 ```
 
+### Limit what is cached
+
+Opening a file downloads its decrypted content to
+`$XDG_CACHE_HOME/protondrive-nemo/blobs/`, and by default it stays there.
+Two environment variables for `mount` narrow that down:
+
+- `PROTONDRIVE_NEMO_CACHE_PATHS`: a comma-separated list of Drive folders
+  whose files may stay cached. Files elsewhere are still fully readable and
+  writable, but their decrypted copy (under `tmp/`) is deleted as soon as the
+  last program using it closes the file.
+- `PROTONDRIVE_NEMO_EPHEMERAL_CACHE=1`: keep nothing. Every open uses a
+  throwaway copy, and the whole content cache is wiped when the mount starts
+  and when it stops.
+
+```bash
+PROTONDRIVE_NEMO_CACHE_PATHS="/Documents,/Photos" node dist/cli.js mount
+PROTONDRIVE_NEMO_EPHEMERAL_CACHE=1 node dist/cli.js mount
+```
+
+The SDK's metadata cache is unaffected: it is encrypted at rest.
+
 ## Architecture
 
 ```
@@ -224,6 +245,7 @@ src/mount.ts             wires DriveTree + ContentStore + FUSE ops into a Fuse i
 src/fuseOps.ts            FUSE syscall handlers (getattr, readdir, read, write, ...)
 src/driveTree.ts          FUSE path <-> Drive node UID resolution + short-lived directory-listing cache
 src/contentStore.ts        local blob cache: download-on-open, upload-on-release
+src/cachePolicy.ts         decides which paths may stay in the local cache (allowlist / ephemeral)
 src/ipcServer.ts            Unix-socket control channel for the `evict` CLI command
                             and the cache-status Nemo extension to talk to the
                             running mount daemon

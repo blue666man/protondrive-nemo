@@ -33,34 +33,57 @@ function guessMediaType(name: string): string {
  * byte-range paging against the remote. Simple and reliable for a v1; the
  * tradeoff is that opening a very large file downloads it in full before
  * any byte is readable — see README limitations.
+ *
+ * Content lives under two directories: `blobs/` (persistent, reused across
+ * opens) and `tmp/` (throwaway, removed on close). The mount's cache policy
+ * decides which one a given file uses; `wipe()` clears both.
  */
 export class ContentStore {
+    private readonly persistentDir: string;
+    private readonly ephemeralDir: string;
+
     constructor(
         private readonly sdk: ProtonDriveClient,
-        private readonly cacheDir: string,
+        cacheRootDir: string,
         private readonly logger: Logger,
-    ) {}
-
-    localPathFor(nodeUid: string): string {
-        return path.join(this.cacheDir, encodeURIComponent(nodeUid));
+    ) {
+        this.persistentDir = path.join(cacheRootDir, 'blobs');
+        this.ephemeralDir = path.join(cacheRootDir, 'tmp');
     }
 
-    /** Whether a file's content is already fully downloaded locally (same freshness check `ensureDownloaded` uses). */
+    private dirFor(ephemeral: boolean): string {
+        return ephemeral ? this.ephemeralDir : this.persistentDir;
+    }
+
+    localPathFor(nodeUid: string, ephemeral = false): string {
+        return path.join(this.dirFor(ephemeral), encodeURIComponent(nodeUid));
+    }
+
+    /** Whether a file's persistent content is already fully downloaded locally (same freshness check `ensureDownloaded` uses). */
     async isCached(node: NodeEntity): Promise<boolean> {
-        const localPath = this.localPathFor(node.uid);
+        return this.isComplete(node, this.persistentDir);
+    }
+
+    private async isComplete(node: NodeEntity, dir: string): Promise<boolean> {
+        const localPath = path.join(dir, encodeURIComponent(node.uid));
         const expectedSize = node.activeRevision?.claimedSize;
         const existing = await stat(localPath).catch(() => undefined);
         return !!existing && (expectedSize === undefined || existing.size === expectedSize);
     }
 
-    async ensureDownloaded(node: NodeEntity): Promise<string> {
-        const localPath = this.localPathFor(node.uid);
+    /** Downloads `node` if needed and returns the local path. `ephemeral` sends the copy to the throwaway directory. */
+    async ensureDownloaded(node: NodeEntity, opts: { ephemeral?: boolean } = {}): Promise<string> {
+        const dir = this.dirFor(!!opts.ephemeral);
 
-        if (await this.isCached(node)) {
-            return localPath;
+        if (!opts.ephemeral && (await this.isCached(node))) {
+            return path.join(dir, encodeURIComponent(node.uid));
+        }
+        if (opts.ephemeral && (await this.isComplete(node, dir))) {
+            return path.join(dir, encodeURIComponent(node.uid));
         }
 
-        await mkdir(this.cacheDir, { recursive: true });
+        const localPath = path.join(dir, encodeURIComponent(node.uid));
+        await mkdir(dir, { recursive: true });
         this.logger.debug(`Downloading ${node.uid} to ${localPath}`);
         const downloader = await this.sdk.getFileDownloader(node.uid);
         const nodeWriteStream = createWriteStream(localPath);
@@ -69,9 +92,10 @@ export class ContentStore {
         return localPath;
     }
 
-    createEmptyLocal(nodeUid: string): Promise<string> {
-        const localPath = this.localPathFor(nodeUid);
-        return mkdir(this.cacheDir, { recursive: true })
+    createEmptyLocal(nodeUid: string, opts: { ephemeral?: boolean } = {}): Promise<string> {
+        const ephemeral = !!opts.ephemeral;
+        const localPath = this.localPathFor(nodeUid, ephemeral);
+        return mkdir(this.dirFor(ephemeral), { recursive: true })
             .then(() => new Promise<void>((resolve, reject) => {
                 const ws = createWriteStream(localPath);
                 ws.end(() => resolve());
@@ -80,8 +104,21 @@ export class ContentStore {
             .then(() => localPath);
     }
 
+    /** Removes a node's local copy from both the persistent and the throwaway cache. */
     async forget(nodeUid: string): Promise<void> {
-        await rm(this.localPathFor(nodeUid), { force: true });
+        await Promise.all([
+            rm(this.localPathFor(nodeUid, false), { force: true }),
+            rm(this.localPathFor(nodeUid, true), { force: true }),
+        ]);
+    }
+
+    /** Deletes every cached blob (persistent and throwaway). Used by the ephemeral-cache mode. */
+    async wipe(): Promise<void> {
+        this.logger.debug(`Wiping content cache under ${this.persistentDir} and ${this.ephemeralDir}`);
+        await Promise.all([
+            rm(this.persistentDir, { recursive: true, force: true }),
+            rm(this.ephemeralDir, { recursive: true, force: true }),
+        ]);
     }
 
     async uploadNewFile(parentUid: string, name: string, localPath: string): Promise<NodeEntity> {

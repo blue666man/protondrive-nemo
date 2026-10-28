@@ -2,6 +2,7 @@ import { mkdir } from 'node:fs/promises';
 
 import Fuse from '@cocalc/fuse-native';
 
+import { createCachePolicy } from './cachePolicy';
 import { ContentStore } from './contentStore';
 import { DriveTree } from './driveTree';
 import { createFuseOperations } from './fuseOps';
@@ -11,6 +12,8 @@ import type { initDrive } from './sdk-bootstrap/init';
 export interface MountHandle {
     fuse: Fuse;
     ipc: IpcServer;
+    /** Wipes the decrypted content cache in ephemeral mode. Call after unmounting. */
+    cleanup: () => Promise<void>;
 }
 
 export async function mount(drive: Awaited<ReturnType<typeof initDrive>>, mountPoint: string): Promise<MountHandle> {
@@ -21,9 +24,14 @@ export async function mount(drive: Awaited<ReturnType<typeof initDrive>>, mountP
     await mkdir(mountPoint, { recursive: true });
 
     const tree = new DriveTree(drive.sdk, drive.logger);
-    const contentCacheDir = `${drive.config.cacheDir}/blobs`;
-    const content = new ContentStore(drive.sdk, contentCacheDir, drive.logger);
-    const { ops, hasUnsavedChanges } = createFuseOperations(drive.sdk, tree, content, drive.logger);
+    const content = new ContentStore(drive.sdk, drive.config.cacheDir, drive.logger);
+    if (drive.config.ephemeralCache) {
+        // Clear anything a previous (possibly crashed) mount left behind
+        // before we start handing out decrypted content again.
+        await content.wipe();
+    }
+    const policy = createCachePolicy(drive.config);
+    const { ops, hasUnsavedChanges } = createFuseOperations(drive.sdk, tree, content, policy, drive.logger);
 
     const isDefaultProfile = drive.config.profile === 'default';
     const fuse = new Fuse(mountPoint, ops, {
@@ -41,7 +49,13 @@ export async function mount(drive: Awaited<ReturnType<typeof initDrive>>, mountP
     const ipc = new IpcServer(socketPathFor(drive.config.cacheDir), tree, content, hasUnsavedChanges, drive.logger);
     await ipc.start();
 
-    return { fuse, ipc };
+    const cleanup = async (): Promise<void> => {
+        if (drive.config.ephemeralCache) {
+            await content.wipe();
+        }
+    };
+
+    return { fuse, ipc, cleanup };
 }
 
 export async function unmount(mountPoint: string): Promise<void> {

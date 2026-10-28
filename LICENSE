@@ -25,3 +25,8 @@ THE SOFTWARE.
 This project vendors and adapts code from ProtonDriveApps/sdk
 (https://github.com/ProtonDriveApps/sdk), Copyright (c) 2025-2026 Proton AG,
 also MIT licensed. See VENDOR.md and vendor/proton-drive-sdk-account/LICENSE.md.
+
+Ported code: src/cachePolicy.ts, and the cache-mode and FUSE-handler code in
+src/contentStore.ts and src/fuseOps.ts, come from NioZow/protondrive-fuse
+(https://github.com/NioZow/protondrive-fuse), a fork of this project,
+Copyright (c) 2026 proton-drive contributors, also MIT licensed.
