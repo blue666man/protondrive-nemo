@@ -8,5 +8,6 @@
       "@protontech/crypto/srp": ["src/types/stubs/protontech-crypto-srp.ts"],
       "@protontech/crypto/polyfill": ["src/types/stubs/protontech-crypto-polyfill.ts"]
     }
-  }
+  },
+  "include": ["src", "test"]
 }

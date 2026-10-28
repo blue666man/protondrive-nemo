@@ -58,6 +58,17 @@ compile the native FUSE binding:
 sudo apt install libfuse-dev   # Debian/Ubuntu/Linux Mint
 ```
 
+## Tests
+
+```bash
+npm test
+```
+
+Runs the unit tests in `test/unit/` with Node's built-in test runner, after
+bundling them with esbuild (`test/run.js`). The FUSE binding is replaced by
+an in-memory stand-in (`test/stubs/fuse-native.ts`), so the tests need
+neither `/dev/fuse` nor any native module to be built.
+
 ## Usage
 
 ```bash
