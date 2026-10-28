@@ -180,6 +180,22 @@ export function createFuseOperations(
             .catch((err) => logger.warn(`Failed to remove cached copy of ${file.name}: ${err}`));
     }
 
+    /**
+     * Existence check for the metadata no-ops below: root, a file created
+     * moments ago that isn't a Drive node yet, or a resolvable node. Lets
+     * access succeed on real paths while still returning ENOENT for paths
+     * that don't exist.
+     */
+    function requirePath(path: string): Promise<void> {
+        if (path === '/') {
+            return Promise.resolve();
+        }
+        if (newFileStates.has(path) || openFilesByPath.has(path)) {
+            return Promise.resolve();
+        }
+        return tree.resolve(path).then(() => undefined);
+    }
+
     const ops: Fuse.OPERATIONS = {
         getattr(path, cb) {
             if (path === '/') {
@@ -206,6 +222,55 @@ export function createFuseOperations(
                 .resolve(path)
                 .then((node) => cb(0, statFor(node)))
                 .catch((err) => cb(errnoFor(err)));
+        },
+
+        // No permission model to enforce beyond the fixed modes getattr()
+        // reports (see statFor): any existing path is accessible.
+        access(path, _mode, cb) {
+            requirePath(path)
+                .then(() => cb(0))
+                .catch((err) => cb(errnoFor(err)));
+        },
+
+        // The local cache copy is disposable: content is uploaded on release,
+        // so there is nothing meaningful to sync to persistent storage.
+        flush(_path, _fd, cb) {
+            cb(0);
+        },
+
+        fsync(_path, _dataSync, _fd, cb) {
+            cb(0);
+        },
+
+        fsyncdir(_path, _dataSync, _fd, cb) {
+            cb(0);
+        },
+
+        statfs(_path, cb) {
+            cb(0, {
+                bsize: 4096,
+                frsize: 4096,
+                blocks: 0,
+                bfree: 0,
+                bavail: 0,
+                files: 0,
+                ffree: 0,
+                favail: 0,
+                fsid: 0,
+                flag: 0,
+                namemax: 255,
+            });
+        },
+
+        // Extended attributes aren't stored on Drive; reads report "none".
+        // There is deliberately no setxattr/removexattr: the kernel then
+        // answers EOPNOTSUPP instead of a write being silently discarded.
+        getxattr(_path, _name, _size, cb) {
+            cb(Fuse.ENODATA);
+        },
+
+        listxattr(_path, cb) {
+            cb(0, []);
         },
 
         readdir(path, cb) {
