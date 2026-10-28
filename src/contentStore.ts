@@ -1,9 +1,11 @@
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, rm, stat } from 'node:fs/promises';
+import { rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { Readable, Writable } from 'node:stream';
 
 import type { Logger, NodeEntity, ProtonDriveClient } from '@protontech/drive-sdk';
+
+import { ensurePrivateDir } from './privateDirs';
 
 const MEDIA_TYPES: Record<string, string> = {
     '.txt': 'text/plain',
@@ -22,6 +24,14 @@ const MEDIA_TYPES: Record<string, string> = {
     '.csv': 'text/csv',
     '.html': 'text/html',
 };
+
+/**
+ * Cached blobs are decrypted file content, so they are owner-only, inside an
+ * owner-only (0700) directory. The mode applies only when a file is created:
+ * a blob left by an older version keeps 0644, but once its directory is 0700
+ * no other user can reach it.
+ */
+const BLOB_MODE = 0o600;
 
 function guessMediaType(name: string): string {
     return MEDIA_TYPES[path.extname(name).toLowerCase()] ?? 'application/octet-stream';
@@ -60,10 +70,10 @@ export class ContentStore {
             return localPath;
         }
 
-        await mkdir(this.cacheDir, { recursive: true });
+        await ensurePrivateDir(this.cacheDir);
         this.logger.debug(`Downloading ${node.uid} to ${localPath}`);
         const downloader = await this.sdk.getFileDownloader(node.uid);
-        const nodeWriteStream = createWriteStream(localPath);
+        const nodeWriteStream = createWriteStream(localPath, { mode: BLOB_MODE });
         const controller = downloader.downloadToStream(Writable.toWeb(nodeWriteStream));
         await controller.completion();
         return localPath;
@@ -71,9 +81,9 @@ export class ContentStore {
 
     createEmptyLocal(nodeUid: string): Promise<string> {
         const localPath = this.localPathFor(nodeUid);
-        return mkdir(this.cacheDir, { recursive: true })
+        return ensurePrivateDir(this.cacheDir)
             .then(() => new Promise<void>((resolve, reject) => {
-                const ws = createWriteStream(localPath);
+                const ws = createWriteStream(localPath, { mode: BLOB_MODE });
                 ws.end(() => resolve());
                 ws.on('error', reject);
             }))

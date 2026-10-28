@@ -246,6 +246,12 @@ true byte-range/streaming implementation would be — a reasonable v1
 tradeoff given Proton's own SDK doesn't yet ship a sync module to build a
 smarter cache on top of (see [VENDOR.md](VENDOR.md)).
 
+The cached copies are decrypted, so they are kept owner-only: `blobs/` is
+mode 0700 and every file in it is created 0600, whatever the umask. A `blobs/`
+directory left by an older version is tightened to 0700 the first time a file
+is cached. The cache and data directories themselves are created 0700 when
+they don't exist yet; an existing one keeps its mode.
+
 Directory listings are cached in memory per folder for 10 seconds to avoid
 re-iterating a folder's children on every single FUSE `getattr`/`readdir`
 call (Nemo issues a lot of these per visible file); mutations you make
