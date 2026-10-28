@@ -32,6 +32,9 @@ export async function mount(drive: Awaited<ReturnType<typeof initDrive>>, mountP
         fsname: isDefaultProfile ? 'protondrive-nemo' : `protondrive-nemo-${drive.config.profile}`,
         displayFolder: isDefaultProfile ? 'Proton Drive' : `Proton Drive (${drive.config.profile})`,
         debug: process.env.PROTONDRIVE_NEMO_FUSE_DEBUG === '1',
+        // Lets root use the mount too (e.g. a backup job). libfuse only allows
+        // this with `user_allow_other` in /etc/fuse.conf; see README.
+        allowRoot: process.env.PROTONDRIVE_NEMO_FUSE_ALLOW_ROOT === '1',
     });
 
     await new Promise<void>((resolve, reject) => {

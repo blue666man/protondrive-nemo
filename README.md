@@ -87,6 +87,18 @@ Other commands: `node dist/cli.js status`, `node dist/cli.js logout`.
 Add `-m /custom/path` to `mount`/`unmount`/`status`/`evict` to use a
 different mount point than the default `~/ProtonDrive`.
 
+### Let root use the mount
+
+A FUSE mount is private to the user who mounted it: even root gets
+"Permission denied". To let root use it as well (for example a backup job
+running as root), set `PROTONDRIVE_NEMO_FUSE_ALLOW_ROOT=1` for the `mount`
+command. libfuse accepts this only when `/etc/fuse.conf` contains the line
+`user_allow_other`; without it the mount fails to start.
+
+```bash
+PROTONDRIVE_NEMO_FUSE_ALLOW_ROOT=1 node dist/cli.js mount
+```
+
 ### Run automatically on login
 
 ```bash
