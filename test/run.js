@@ -52,14 +52,6 @@ async function main() {
         plugins: [forbidNativeModules],
     });
     const outFiles = entryPoints.map((entry) => path.join(outDir, `${path.basename(entry, '.ts')}.js`));
-    // Unmounting execs `fusermount -uz`, which only works setuid. A
-    // `nix shell nixpkgs#fuse` puts the store's plain copy first on PATH,
-    // so the mount suite puts NixOS's setuid wrappers ahead of it.
-    const wrappers = '/run/wrappers/bin';
-    const env =
-        realFuse && fs.existsSync(path.join(wrappers, 'fusermount'))
-            ? { ...process.env, PATH: `${wrappers}${path.delimiter}${process.env.PATH ?? ''}` }
-            : process.env;
     const result = spawnSync(
         process.execPath,
         [
@@ -69,7 +61,7 @@ async function main() {
             ...(realFuse ? ['--test-concurrency=1'] : []),
             ...outFiles,
         ],
-        { stdio: 'inherit', env },
+        { stdio: 'inherit' },
     );
     process.exit(result.status ?? 1);
 }

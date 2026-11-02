@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { chmodSync, mkdirSync, utimesSync, writeFileSync } from 'node:fs';
-import { readFile, stat } from 'node:fs/promises';
+import { readdir, readFile, stat, utimes } from 'node:fs/promises';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
 import { promisify } from 'node:util';
@@ -73,6 +73,23 @@ function since(start: number) {
     return fake.uploads.slice(start).map((u) => [u.kind, u.name, u.claimedModificationTime?.toISOString()]);
 }
 
+test("the FUSE binding passes utimens' mtime (sagemathinc/fuse-native#3)", async () => {
+    const start = fake.uploads.length;
+    const f = path.join(mnt, 'binding.txt');
+    await exec('sh', ['-c', 'printf x > "$1"', 'sh', f]);
+    // One utimensat with distinct times: a binding that hands JS the atime
+    // in place of the mtime makes the file report T2.
+    await utimes(f, T2, T1);
+    assert.equal(
+        (await stat(f)).mtime.toISOString(),
+        T1.toISOString(),
+        'the native binding lacks the fix for https://github.com/sagemathinc/fuse-native/issues/3 ' +
+            '(fuse-native.c line 346, utimens: l->atime -> l->mtime); see README, Tests',
+    );
+    await settled();
+    assert.deepEqual(since(start), [['new', 'binding.txt', T1.toISOString()]]);
+});
+
 test('rsync -rlt: one upload per file with the source times; a second run uploads nothing', async () => {
     const start = fake.uploads.length;
     const src = source('src1', [
@@ -95,18 +112,22 @@ test('rsync -rlt: one upload per file with the source times; a second run upload
     assert.doesNotMatch(stdout, /^>f/m);
 });
 
-test('rsync -a: chmod is refused (exit 23); content and time still arrive', async () => {
+test('rsync -a: chmod is refused, so rsync skips every file (exit 23); use rsync -rlt', async () => {
     const start = fake.uploads.length;
     const src = source('src2', [['p.txt', 'private', T1]]);
     chmodSync(path.join(src, 'p.txt'), 0o600);
-    const err = await exec('rsync', ['-a', `${src}/`, `${path.join(mnt, 'r2')}/`]).then(
+    const dest = path.join(mnt, 'r2');
+    // rsync fchmods its temp file, gets EPERM, then unlinks the temp file
+    // and skips the file.
+    const err = await exec('rsync', ['-a', `${src}/`, `${dest}/`]).then(
         () => undefined,
         (e: { code?: number; stderr?: string }) => e,
     );
     assert.equal(err?.code, 23);
     assert.match(err?.stderr ?? '', /Operation not permitted/);
     await settled();
-    assert.deepEqual(since(start), [['new', 'p.txt', T1.toISOString()]]);
+    assert.deepEqual(since(start), []);
+    assert.ok(!(await readdir(dest)).includes('p.txt'), 'p.txt arrived in the destination');
 });
 
 test('cp --preserve=timestamps keeps the time; cp -p too, but reports the refused chmod', async () => {

@@ -74,10 +74,16 @@ npm rebuild @cocalc/fuse-native   # once: builds the native FUSE binding
 npm run test:mount
 ```
 
-Mounts the filesystem for real (the native binding, `/dev/fuse` and
-`fusermount` are needed), backed by an in-memory Drive (`test/fakeDrive.ts`),
-and drives it with `rsync`, `cp`, `touch` and `mv`. It checks that every
-file is uploaded once, under its final name, with its own modification time.
+Mounts the filesystem for real, backed by an in-memory Drive
+(`test/fakeDrive.ts`), and drives it with `rsync`, `cp`, `touch` and `mv`. It
+checks that every file is uploaded once, under its final name, with its own
+modification time. It needs `/dev/fuse`, a setuid `fusermount`, and the native
+binding built with the fix for
+[fuse-native#3](https://github.com/sagemathinc/fuse-native/issues/3). Until a
+fixed release exists: in `node_modules/@cocalc/fuse-native/fuse-native.c`,
+change `l->atime` to `l->mtime` in the second `FUSE_UINT64_TO_INTS_ARGV` of
+the `utimens` method, delete its `build/` directory, then run
+`npm rebuild @cocalc/fuse-native`.
 
 ## Usage
 
