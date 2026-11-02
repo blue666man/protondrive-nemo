@@ -153,7 +153,7 @@ export function createFuseOperations(
     async function finalizeNewFile(path: string, state: NewFileState): Promise<void> {
         newFileStates.delete(path);
         try {
-            const created = await content.uploadNewFile(state.parentUid, state.name, state.localPath);
+            const created = await content.uploadNewFile(state.parentUid, state.name, state.localPath, { modificationTime: new Date() });
             tree.rememberNode(created);
             tree.invalidate(state.parentUid);
             await content.forget(state.node.uid);
@@ -369,7 +369,7 @@ export function createFuseOperations(
                             return;
                         }
                         try {
-                            await content.uploadRevision(file.node, file.localPath);
+                            await content.uploadRevision(file.node.uid, file.name, file.localPath, { modificationTime: new Date() });
                             tree.invalidate(file.parentUid);
                             cb(0);
                         } catch (err) {

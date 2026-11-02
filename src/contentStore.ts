@@ -27,6 +27,13 @@ function guessMediaType(name: string): string {
     return MEDIA_TYPES[path.extname(name).toLowerCase()] ?? 'application/octet-stream';
 }
 
+export interface UploadOptions {
+    /** Claimed modification time, stored (encrypted) with the revision. */
+    modificationTime: Date;
+    /** Cancels both the wait for a slot in the SDK's upload queue and the upload itself. */
+    signal?: AbortSignal;
+}
+
 /**
  * Materializes Drive file content to local disk on demand (download on
  * first open, upload on release-if-dirty), instead of implementing
@@ -84,30 +91,32 @@ export class ContentStore {
         await rm(this.localPathFor(nodeUid), { force: true });
     }
 
-    async uploadNewFile(parentUid: string, name: string, localPath: string): Promise<NodeEntity> {
+    async uploadNewFile(parentUid: string, name: string, localPath: string, options: UploadOptions): Promise<NodeEntity> {
         const size = (await stat(localPath)).size;
-        const uploader = await this.sdk.getFileUploader(parentUid, name, {
-            mediaType: guessMediaType(name),
-            expectedSize: size,
-            modificationTime: new Date(),
-        });
+        const uploader = await this.sdk.getFileUploader(
+            parentUid,
+            name,
+            { mediaType: guessMediaType(name), expectedSize: size, modificationTime: options.modificationTime },
+            options.signal,
+        );
+        // Opened only now: getFileUploader waits for a slot in the SDK's upload queue.
         const stream = Readable.toWeb(createReadStream(localPath)) as ReadableStream;
         const controller = await uploader.uploadFromStream(stream, []);
         const { nodeUid } = await controller.completion();
         return this.sdk.getNode(nodeUid);
     }
 
-    async uploadRevision(node: NodeEntity, localPath: string): Promise<void> {
+    /** Uploads a new revision of `nodeUid`; resolves with the new revision's uid. */
+    async uploadRevision(nodeUid: string, name: string, localPath: string, options: UploadOptions): Promise<string> {
         const size = (await stat(localPath)).size;
-        const uploader = await this.sdk.getFileRevisionUploader(node.uid, {
-            mediaType: guessMediaType(node.name.ok ? node.name.value : ''),
-            expectedSize: size,
-            modificationTime: new Date(),
-        });
+        const uploader = await this.sdk.getFileRevisionUploader(
+            nodeUid,
+            { mediaType: guessMediaType(name), expectedSize: size, modificationTime: options.modificationTime },
+            options.signal,
+        );
         const stream = Readable.toWeb(createReadStream(localPath)) as ReadableStream;
         const controller = await uploader.uploadFromStream(stream, []);
-        await controller.completion();
-        // Re-download disabled: the local file we just uploaded from is
-        // already the authoritative content, no need to round-trip it.
+        const { nodeRevisionUid } = await controller.completion();
+        return nodeRevisionUid;
     }
 }
