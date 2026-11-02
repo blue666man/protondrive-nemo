@@ -61,6 +61,8 @@ export interface PendingUpload {
     changedDuringUpload: boolean;
     /** Serialises this entry's journal writes. */
     saved: Promise<void>;
+    /** Why the last journal write failed; cleared by the next one that succeeds. */
+    journalError?: unknown;
     waiters: Array<(outcome: AttemptOutcome) => void>;
 }
 
@@ -103,7 +105,7 @@ export interface PendingUploadsOptions {
     now?: () => Date;
 }
 
-/** How long shutdown waits for aborted uploads to wind down before journaling anyway. */
+/** How long shutdown and cancel wait for aborted uploads to wind down. */
 const ABORT_WAIT_MS = 2000;
 
 /** `created`: `node` was made by this attempt (a new file or conflict copy), not found on Drive. */
@@ -279,7 +281,8 @@ export class PendingUploads {
         entry.cancelled = true;
         this.clearTimer(entry);
         entry.abort?.abort();
-        await entry.running;
+        // Bounded: an upload that ignores its abort and lands later is trashed by finish().
+        await settleWithin(entry.running ? [entry.running] : [], ABORT_WAIT_MS);
         this.notify(entry, 'cancelled');
         await this.save(entry, 'remove');
     }
@@ -341,11 +344,12 @@ export class PendingUploads {
             this.o.logger.warn(problem);
         }
         for (const record of records) {
-            if (this.byPath.has(record.path)) {
-                this.o.logger.warn(`Two pending uploads for ${record.path}; keeping the first`);
-                continue;
-            }
             const { claimedMtime, state, ...fields } = record;
+            if (this.byPath.has(record.path)) {
+                // Not visible under its path any more, but still uploaded: uploads go by parent and name.
+                fields.path = `${record.path}#${record.id}`;
+                this.o.logger.warn(`Two pending uploads for ${record.path}; the second is kept as ${fields.path}`);
+            }
             const entry = this.register({ ...fields, refCount: 0, state: state === 'failed' ? 'failed' : 'settling' });
             const seconds = claimedMtime / 1000;
             await utimes(entry.localPath, seconds, seconds).catch(() => {});
@@ -441,8 +445,12 @@ export class PendingUploads {
             return { error, permanent: true };
         }
         try {
-            // The journal knows about the upload before it can land.
+            // The journal knows about the upload before it can land. If it can't, the upload must
+            // not run: a crash would leave content on Drive that no record accounts for.
             await entry.saved;
+            if (entry.journalError !== undefined) {
+                return { error: entry.journalError, permanent: false };
+            }
             const options: UploadOptions = { modificationTime: (await stat(entry.localPath)).mtime, signal };
             const landed = entry.kind === 'revision' ? await this.uploadRevision(entry, options) : await this.uploadNew(entry, options);
             return { landed };
@@ -465,7 +473,11 @@ export class PendingUploads {
                 // Already there: an earlier attempt landed before it was recorded.
                 return { node: current, revisionUid: current.activeRevision?.uid };
             }
-            this.o.logger.warn(`${entry.path} changed on Drive since it was changed here; keeping both`);
+            if (entry.baseRevisionUid === undefined) {
+                this.o.logger.warn(`${entry.path}: the revision this change started from is unknown; keeping both`);
+            } else {
+                this.o.logger.warn(`${entry.path} changed on Drive since it was changed here; keeping both`);
+            }
             return this.uploadConflictCopy(entry, options);
         }
         return { revisionUid: await this.o.content.uploadRevision(nodeUid, entry.name, entry.localPath, options) };
@@ -519,7 +531,7 @@ export class PendingUploads {
 
     private async sameContent(entry: PendingUpload, node: NodeEntity): Promise<boolean> {
         const remote = node.activeRevision?.claimedDigests?.sha1;
-        return !!remote && remote === (await sha1Of(entry.localPath));
+        return !!remote && remote.toLowerCase() === (await sha1Of(entry.localPath)).toLowerCase();
     }
 
     private async finish(entry: PendingUpload, abort: AbortController, result: Attempt): Promise<void> {
@@ -662,8 +674,12 @@ export class PendingUploads {
                 await entry.ready;
                 const { mtimeMs } = await stat(entry.localPath);
                 await this.o.journal.write(this.recordOf(entry, Math.floor(mtimeMs)));
+                entry.journalError = undefined;
             })
-            .catch((error) => this.o.logger.error(`Could not ${op} the journal record for ${entry.path}`, error));
+            .catch((error) => {
+                entry.journalError = error;
+                this.o.logger.error(`Could not ${op} the journal record for ${entry.path}`, error);
+            });
         return entry.saved;
     }
 

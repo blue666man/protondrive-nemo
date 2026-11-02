@@ -103,7 +103,7 @@ export class PendingJournal {
             }
             if (!present.has(`${id}.blob`)) {
                 await rm(full, { force: true });
-                problems.push(`Pending upload of ${record.path} has no content left; dropped`);
+                problems.push(`Pending upload of ${record.path} has no content (already uploaded, or lost); record dropped`);
                 continue;
             }
             records.push(record);
