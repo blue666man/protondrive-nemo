@@ -7,8 +7,10 @@ import assert from 'node:assert/strict';
 import { writeFile } from 'node:fs/promises';
 import { test } from 'node:test';
 
+import { ServerError } from '@protontech/drive-sdk';
+
 import { closedNewFile, type PendingSetup, setupPending } from '../pendingSetup';
-import { waitFor } from '../support';
+import { sleep, waitFor } from '../support';
 
 /** Holds uploads (committing even if aborted) and starts a flush; resolves once an upload is in flight. */
 async function heldFlush(s: PendingSetup) {
@@ -91,4 +93,39 @@ test('our own revision that landed despite a cancel is not taken for a remote ed
     assert.ok(!s.fake.uploads.some((u) => u.name.includes('conflict')), 'no conflict copy');
     const last = s.fake.uploads.at(-1);
     assert.deepEqual([last?.kind, last?.nodeUid], ['revision', uid]);
+});
+
+test('flush does not wait on a file reopened and changed during its upload', { timeout: 5000 }, async (t) => {
+    const s = await setupPending();
+    t.after(s.cleanup);
+    const entry = await closedNewFile(s, '/e.txt', 'first');
+    const release = s.fake.holdUploads();
+    const flushed = s.pending.flush();
+    await waitFor(() => s.fake.inFlight === 1, 3000, 'the upload to start');
+    s.pending.opened(entry);
+    await writeFile(entry.localPath, 'second');
+    s.pending.touched(entry);
+    release();
+    assert.deepEqual(await flushed, { uploaded: 0, failed: 0, retrying: 0, open: 1 });
+    s.pending.closed(entry);
+    assert.equal((await s.pending.flush()).uploaded, 1);
+    const last = s.fake.uploads.at(-1);
+    assert.equal(s.fake.contentOf(last?.nodeUid as string), 'second');
+});
+
+test('a transient failure while the file is open retries after the last close', { timeout: 5000 }, async (t) => {
+    const s = await setupPending({ settleMs: 30 });
+    t.after(s.cleanup);
+    const entry = await closedNewFile(s, '/f.txt', 'f');
+    const release = s.fake.holdUploads();
+    const flushed = s.pending.flush();
+    await waitFor(() => s.fake.inFlight === 1, 3000, 'the upload to start');
+    s.pending.opened(entry);
+    s.fake.failNextUpload(new ServerError('down'));
+    release();
+    assert.deepEqual(await flushed, { uploaded: 0, failed: 0, retrying: 1, open: 0 });
+    await sleep(100); // past any retry delay (at most 40 ms): no retry while open
+    assert.equal(s.fake.uploads.length, 0);
+    s.pending.closed(entry);
+    await waitFor(() => s.fake.uploads.length === 1, 3000, 'the upload after the close');
 });

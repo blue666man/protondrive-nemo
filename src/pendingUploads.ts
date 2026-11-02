@@ -65,7 +65,8 @@ export interface PendingUpload {
 
 export type UploadTarget = Pick<PendingUpload, 'kind' | 'nodeUid' | 'parentUid' | 'name'>;
 
-export type AttemptOutcome = 'uploaded' | 'failed' | 'retrying' | 'stopped' | 'cancelled';
+/** `open`: the file was reopened during the attempt; it goes again after the last close. */
+export type AttemptOutcome = 'uploaded' | 'failed' | 'retrying' | 'stopped' | 'cancelled' | 'open';
 
 export interface PendingStatus {
     /** Still open in some application. */
@@ -300,6 +301,8 @@ export class PendingUploads {
                             result.uploaded++;
                         } else if (outcome === 'failed') {
                             result.failed++;
+                        } else if (outcome === 'open') {
+                            result.open++;
                         } else if (outcome !== 'cancelled') {
                             result.retrying++;
                         }
@@ -589,6 +592,14 @@ export class PendingUploads {
             return;
         }
         entry.attempts++;
+        if (entry.refCount > 0) {
+            // Reopened meanwhile: a retry timer would find it open and give up. The last close retries it.
+            this.o.logger.warn(`Upload of ${entry.path} failed (attempt ${entry.attempts}); retrying once it is closed: ${entry.error}`);
+            entry.state = 'open';
+            void this.save(entry);
+            this.notify(entry, 'retrying');
+            return;
+        }
         const delay = Math.min((this.o.retryBaseMs ?? 1000) * 2 ** (entry.attempts - 1), this.o.retryMaxMs ?? 300_000);
         this.o.logger.warn(`Upload of ${entry.path} failed (attempt ${entry.attempts}); retrying in ${delay} ms: ${entry.error}`);
         entry.state = 'retrying';
@@ -619,7 +630,9 @@ export class PendingUploads {
     private afterChange(entry: PendingUpload): void {
         entry.changedDuringUpload = false;
         if (entry.refCount > 0) {
+            // A flush waiting on this entry must not wait for an application to close it.
             entry.state = 'open';
+            this.notify(entry, 'open');
         } else {
             this.settle(entry);
             if (entry.waiters.length > 0) {
