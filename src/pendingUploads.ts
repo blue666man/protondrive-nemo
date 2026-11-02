@@ -124,6 +124,14 @@ type Attempt = { landed: Landed } | { error: unknown; permanent: boolean };
  */
 export class PendingUploads {
     private readonly byPath = new Map<string, PendingUpload>();
+    /**
+     * nodeUid → the last revision we uploaded of it, so a revision that
+     * landed after its entry moved on (cancelled, or changed) is not taken
+     * for an edit by another client. An upload the server committed while
+     * the client only saw AbortError is not known here: the next attempt
+     * keeps both versions (a spurious conflict copy, never data loss).
+     */
+    private readonly ownRevisions = new Map<string, string>();
     private stopping = false;
 
     constructor(private readonly o: PendingUploadsOptions) {}
@@ -446,7 +454,9 @@ export class PendingUploads {
             this.o.logger.warn(`${entry.path} was deleted on Drive meanwhile; uploading it as a new file`);
             return this.uploadNew(entry, options);
         }
-        if (current.activeRevision?.uid !== entry.baseRevisionUid) {
+        const active = current.activeRevision?.uid;
+        const ours = active !== undefined && active === this.ownRevisions.get(nodeUid);
+        if (active !== entry.baseRevisionUid && !ours) {
             if (await this.sameContent(entry, current)) {
                 // Already there: an earlier attempt landed before it was recorded.
                 return { node: current, revisionUid: current.activeRevision?.uid };
@@ -514,6 +524,10 @@ export class PendingUploads {
             const { node, revisionUid, created } = result.landed;
             const target = entry.target as UploadTarget;
             const nodeUid = node?.uid ?? (target.nodeUid as string);
+            const landedRevisionUid = revisionUid ?? node?.activeRevision?.uid;
+            if (landedRevisionUid) {
+                this.ownRevisions.set(nodeUid, landedRevisionUid);
+            }
             if (node) {
                 this.o.tree.rememberNode(node);
             }
@@ -536,7 +550,7 @@ export class PendingUploads {
                     // The change becomes a revision of what landed.
                     entry.kind = 'revision';
                     entry.nodeUid = nodeUid;
-                    entry.baseRevisionUid = revisionUid ?? node?.activeRevision?.uid;
+                    entry.baseRevisionUid = landedRevisionUid;
                 }
                 if (!entry.cancelled) {
                     this.afterChange(entry);

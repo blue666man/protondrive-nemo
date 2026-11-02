@@ -4,6 +4,7 @@
  * be mistaken for someone else's edit.
  */
 import assert from 'node:assert/strict';
+import { writeFile } from 'node:fs/promises';
 import { test } from 'node:test';
 
 import { closedNewFile, type PendingSetup, setupPending } from '../pendingSetup';
@@ -64,4 +65,30 @@ test('cancel during an upload that lands anyway trashes what landed', { timeout:
     await flushed;
     assert.equal(s.fake.uploads.length, 1, 'the upload did land');
     assert.equal(s.fake.find('/c.txt'), undefined, 'and was trashed');
+});
+
+test('our own revision that landed despite a cancel is not taken for a remote edit', { timeout: 5000 }, async (t) => {
+    const s = await setupPending();
+    t.after(s.cleanup);
+    const uid = s.fake.addFile(s.fake.rootUid, 'r.txt', 'v1');
+    const node = await s.fake.client.getNode(uid);
+    await s.content.ensureDownloaded(node);
+    const edit = s.pending.beginRevision('/r.txt', node, s.fake.rootUid, 'r.txt', 1);
+    await edit.ready;
+    await writeFile(edit.localPath, 'v2');
+    s.pending.closed(edit);
+    const { release, flushed } = await heldFlush(s);
+    const base = s.pending.get('/r.txt')?.baseRevisionUid;
+    await closedNewFile(s, '/.r.swp', 'v3');
+    // An editor saves: its swap file replaces r.txt, whose own upload is still in flight.
+    const cancelled = s.pending.cancel('/r.txt');
+    s.pending.move('/.r.swp', '/r.txt', s.fake.rootUid, 'r.txt', { nodeUid: uid, baseRevisionUid: base });
+    release();
+    await cancelled;
+    await flushed;
+    await s.pending.flush();
+    assert.equal(s.fake.contentOf(uid), 'v3');
+    assert.ok(!s.fake.uploads.some((u) => u.name.includes('conflict')), 'no conflict copy');
+    const last = s.fake.uploads.at(-1);
+    assert.deepEqual([last?.kind, last?.nodeUid], ['revision', uid]);
 });
