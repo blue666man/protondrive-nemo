@@ -7,6 +7,7 @@ import type { Logger, NodeEntity } from '@protontech/drive-sdk';
 
 import type { ContentStore } from './contentStore';
 import { DriveTree, NodeNotFoundError } from './driveTree';
+import type { PendingUploads } from './pendingUploads';
 
 type Request = { op: 'evict'; path: string } | { op: 'cacheStatus'; path: string };
 
@@ -58,6 +59,7 @@ export class IpcServer {
         private readonly content: ContentStore,
         private readonly hasUnsavedChanges: (path: string) => boolean,
         private readonly logger: Logger,
+        private readonly pending: Pick<PendingUploads, 'status' | 'flush'>,
     ) {}
 
     async start(): Promise<void> {
