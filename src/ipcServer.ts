@@ -1,4 +1,4 @@
-import { createServer, type Server, type Socket } from 'node:net';
+import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { unlink } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -7,9 +7,7 @@ import type { Logger, NodeEntity } from '@protontech/drive-sdk';
 
 import type { ContentStore } from './contentStore';
 import { DriveTree, NodeNotFoundError } from './driveTree';
-import type { PendingUploads } from './pendingUploads';
-
-type Request = { op: 'evict'; path: string } | { op: 'cacheStatus'; path: string };
+import type { FlushResult, PendingStatus, PendingUploads } from './pendingUploads';
 
 interface EvictResponse {
     ok: boolean;
@@ -23,6 +21,26 @@ interface CacheStatusResponse {
     error?: string;
     entries?: Record<string, CacheState>;
 }
+
+export type IpcRequest =
+    | { op: 'evict'; path: string }
+    | { op: 'cacheStatus'; path: string }
+    | { op: 'pendingStatus' }
+    | { op: 'flush' };
+
+interface PendingStatusResponse {
+    ok: boolean;
+    error?: string;
+    status?: PendingStatus;
+}
+
+interface FlushResponse {
+    ok: boolean;
+    error?: string;
+    result?: FlushResult;
+}
+
+type Response = EvictResponse | CacheStatusResponse | PendingStatusResponse | FlushResponse;
 
 /**
  * Wall-clock budget for a single cacheStatus request, covering every
@@ -41,6 +59,36 @@ const CACHE_STATUS_DEADLINE_MS = 1200;
 /** Where the running mount daemon's IPC socket lives, given its cache dir. Shared by mount.ts (server) and cli.ts (client). */
 export function socketPathFor(cacheDir: string): string {
     return path.join(cacheDir, 'daemon.sock');
+}
+
+/**
+ * Sends one request to the mount daemon listening on `socketPath` and
+ * resolves with its answer. Rejects with `mount-not-running` when nothing
+ * listens there.
+ */
+export function sendRequest<T = unknown>(socketPath: string, request: IpcRequest): Promise<T> {
+    return new Promise((resolve, reject) => {
+        const socket = createConnection(socketPath);
+        let buffer = '';
+        socket.on('connect', () => {
+            socket.write(`${JSON.stringify(request)}\n`);
+        });
+        socket.on('data', (chunk) => {
+            buffer += chunk.toString('utf8');
+            const newlineIndex = buffer.indexOf('\n');
+            if (newlineIndex >= 0) {
+                socket.end();
+                try {
+                    resolve(JSON.parse(buffer.slice(0, newlineIndex)) as T);
+                } catch (err) {
+                    reject(err);
+                }
+            }
+        });
+        socket.on('error', (err: NodeJS.ErrnoException) => {
+            reject(new Error(err.code === 'ENOENT' || err.code === 'ECONNREFUSED' ? 'mount-not-running' : err.message));
+        });
+    });
 }
 
 /**
@@ -99,7 +147,7 @@ export class IpcServer {
             return;
         }
         this.handleRequest(line)
-            .catch((err): EvictResponse | CacheStatusResponse => ({
+            .catch((err): Response => ({
                 ok: false,
                 error: err instanceof NodeNotFoundError ? 'not-found' : err instanceof Error ? err.message : String(err),
             }))
@@ -108,13 +156,19 @@ export class IpcServer {
             });
     }
 
-    private async handleRequest(line: string): Promise<EvictResponse | CacheStatusResponse> {
-        const req = JSON.parse(line) as Request;
+    private async handleRequest(line: string): Promise<Response> {
+        const req = JSON.parse(line) as IpcRequest;
         if (req.op === 'evict') {
             return this.handleEvict(req.path);
         }
         if (req.op === 'cacheStatus') {
             return this.handleCacheStatus(req.path);
+        }
+        if (req.op === 'pendingStatus') {
+            return { ok: true, status: this.pending.status() };
+        }
+        if (req.op === 'flush') {
+            return { ok: true, result: await this.pending.flush() };
         }
         throw new Error(`Unknown op: ${(req as { op: string }).op}`);
     }

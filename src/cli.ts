@@ -1,12 +1,12 @@
 import './polyfills';
 
-import { createConnection } from 'node:net';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
 import { Command } from 'commander';
 
-import { socketPathFor } from './ipcServer';
+import { sendRequest, socketPathFor } from './ipcServer';
+import type { FlushResult, PendingStatus } from './pendingUploads';
 import { getConfig } from './sdk-bootstrap/config';
 import { initDrive } from './sdk-bootstrap/init';
 import { mount, unmount } from './mount';
@@ -81,6 +81,17 @@ program
         console.log(`Account: ${d.config.profile}`);
         console.log(`Logged in: ${d.auth.isLoggedIn()}`);
         console.log(`Mount point: ${opts.mountPoint ?? defaultMountPointFor(opts.account)}`);
+        const pending = await pendingStatus(opts.account);
+        if (!pending) {
+            console.log('Mount: not running');
+        } else {
+            console.log(
+                `Pending uploads: ${pendingCount(pending)} (uploading ${pending.uploading}, still open ${pending.open}, failed ${pending.failed})`,
+            );
+            for (const failure of pending.failures) {
+                console.log(`  failed: ${failure.path}: ${failure.error}`);
+            }
+        }
         await d.dispose();
         process.exit(0);
     });
@@ -93,11 +104,17 @@ program
     .action(async (opts: { account?: string; mountPoint?: string }) => {
         const mountPoint = opts.mountPoint ?? defaultMountPointFor(opts.account);
         const d = await drive(opts.account);
-        const { fuse, ipc } = await mount(d, mountPoint);
+        const { fuse, ipc, pending, shutdownGraceMs } = await mount(d, mountPoint);
         console.log(`Mounted Proton Drive at ${mountPoint}`);
 
         const shutdown = async () => {
             console.log('\nUnmounting...');
+            // Bounded: running uploads get the grace period, the rest wait in
+            // the journal for the next mount.
+            const remaining = await pending.shutdown(shutdownGraceMs);
+            if (remaining > 0) {
+                console.log(`${remaining} upload(s) still pending; they resume on the next mount.`);
+            }
             await ipc.stop();
             await new Promise<void>((resolve) => fuse.unmount((err) => {
                 if (err) console.error('Unmount failed:', err);
@@ -117,9 +134,33 @@ program
     .option('-m, --mount-point <path>', 'mount point')
     .action(async (opts: { account?: string; mountPoint?: string }) => {
         const mountPoint = opts.mountPoint ?? defaultMountPointFor(opts.account);
+        const pending = await pendingStatus(opts.account);
         await unmount(mountPoint);
         console.log(`Unmounted ${mountPoint}`);
+        if (pending && pendingCount(pending) > 0) {
+            console.log(`${pendingCount(pending)} upload(s) still pending; they resume on the next mount.`);
+        }
         process.exit(0);
+    });
+
+program
+    .command('flush')
+    .description('Upload every pending change now and wait for it; exits non-zero if anything is still not on Drive')
+    .option(...ACCOUNT_OPTION)
+    .action(async (opts: { account?: string }) => {
+        let res: { ok: boolean; error?: string; result?: FlushResult };
+        try {
+            res = await sendRequest(socketFor(opts.account), { op: 'flush' });
+        } catch (err) {
+            res = { ok: false, error: errorCode(err) };
+        }
+        if (!res.ok || !res.result) {
+            console.error(`flush: ${describeEvictError(res.error)}`);
+            process.exit(1);
+        }
+        const r = res.result;
+        console.log(`Uploaded ${r.uploaded}; failed ${r.failed}; will retry ${r.retrying}; still open ${r.open}`);
+        process.exit(r.failed + r.retrying + r.open > 0 ? 1 : 0);
     });
 
 program
@@ -136,7 +177,7 @@ program
         for (const target of paths) {
             try {
                 const fusePath = toFusePath(target, mountPoint);
-                const res = await sendEvict(socketPath, fusePath);
+                const res = await sendRequest<{ ok: boolean; error?: string }>(socketPath, { op: 'evict', path: fusePath });
                 if (res.ok) {
                     console.log(`Cleared cache: ${target}`);
                 } else {
@@ -162,31 +203,6 @@ function toFusePath(absPath: string, mountPoint: string): string {
     return rel === '' ? '/' : rel.split(path.sep).join('/');
 }
 
-function sendEvict(socketPath: string, fusePath: string): Promise<{ ok: boolean; error?: string }> {
-    return new Promise((resolve, reject) => {
-        const socket = createConnection(socketPath);
-        let buffer = '';
-        socket.on('connect', () => {
-            socket.write(`${JSON.stringify({ op: 'evict', path: fusePath })}\n`);
-        });
-        socket.on('data', (chunk) => {
-            buffer += chunk.toString('utf8');
-            const newlineIndex = buffer.indexOf('\n');
-            if (newlineIndex >= 0) {
-                socket.end();
-                try {
-                    resolve(JSON.parse(buffer.slice(0, newlineIndex)));
-                } catch (err) {
-                    reject(err);
-                }
-            }
-        });
-        socket.on('error', (err: NodeJS.ErrnoException) => {
-            reject(new Error(err.code === 'ENOENT' || err.code === 'ECONNREFUSED' ? 'mount-not-running' : err.message));
-        });
-    });
-}
-
 function errorCode(err: unknown): string {
     if (err instanceof Error) {
         return err.message;
@@ -205,7 +221,7 @@ function describeEvictError(code?: string): string {
         return "is a folder — use the mount's root right-click action to clear the whole cache instead";
     }
     if (code === 'open-with-unsaved-changes') {
-        return 'is currently open with unsaved changes — save or close it first';
+        return 'has changes not on Drive yet — run `protondrive-nemo flush` (or close it) first';
     }
     if (code === 'mount-not-running') {
         return 'Proton Drive mount is not running';
@@ -214,6 +230,23 @@ function describeEvictError(code?: string): string {
         return `is not under the mount point ${code.slice('not-under-mount:'.length)}`;
     }
     return code;
+}
+
+function socketFor(account?: string): string {
+    return socketPathFor(getConfig({ appVersion: APP_VERSION, clientUidPrefix: 'protondrive-nemo', profile: account }).cacheDir);
+}
+
+/** The running daemon's pending-upload counts, or undefined if no mount is running. */
+async function pendingStatus(account?: string): Promise<PendingStatus | undefined> {
+    try {
+        return (await sendRequest<{ ok: boolean; status?: PendingStatus }>(socketFor(account), { op: 'pendingStatus' })).status;
+    } catch {
+        return undefined;
+    }
+}
+
+function pendingCount(status: PendingStatus): number {
+    return status.open + status.pending + status.uploading + status.failed;
 }
 
 program.parseAsync(process.argv).catch((err) => {
