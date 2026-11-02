@@ -69,6 +69,16 @@ bundling them with esbuild (`test/run.js`). The FUSE binding is replaced by
 an in-memory stand-in (`test/stubs/fuse-native.ts`), so the tests need
 neither `/dev/fuse` nor any native module to be built.
 
+```bash
+npm rebuild @cocalc/fuse-native   # once: builds the native FUSE binding
+npm run test:mount
+```
+
+Mounts the filesystem for real (the native binding, `/dev/fuse` and
+`fusermount` are needed), backed by an in-memory Drive (`test/fakeDrive.ts`),
+and drives it with `rsync`, `cp`, `touch` and `mv`. It checks that every
+file is uploaded once, under its final name, with its own modification time.
+
 ## Usage
 
 ```bash

@@ -16,6 +16,10 @@ const esbuild = require('esbuild');
 const suite = process.argv[2] ?? 'unit';
 const srcDir = path.join('test', suite);
 const outDir = path.join('.test-build', suite);
+// The mount suite runs against the real kernel FUSE: it loads the native
+// binding (built with `npm rebuild @cocalc/fuse-native`) from node_modules
+// at run time instead of the in-memory stub, one test file at a time.
+const realFuse = suite === 'mount';
 
 const forbidNativeModules = {
     name: 'forbid-native-modules',
@@ -42,16 +46,30 @@ async function main() {
         sourcemap: 'inline',
         logLevel: 'warning',
         // Same reasons as in esbuild.config.js.
-        external: ['open'],
+        external: realFuse ? ['open', '@cocalc/fuse-native'] : ['open'],
         conditions: ['browser'],
-        alias: { '@cocalc/fuse-native': './test/stubs/fuse-native.ts' },
+        alias: realFuse ? {} : { '@cocalc/fuse-native': './test/stubs/fuse-native.ts' },
         plugins: [forbidNativeModules],
     });
     const outFiles = entryPoints.map((entry) => path.join(outDir, `${path.basename(entry, '.ts')}.js`));
+    // Unmounting execs `fusermount -uz`, which only works setuid. A
+    // `nix shell nixpkgs#fuse` puts the store's plain copy first on PATH,
+    // so the mount suite puts NixOS's setuid wrappers ahead of it.
+    const wrappers = '/run/wrappers/bin';
+    const env =
+        realFuse && fs.existsSync(path.join(wrappers, 'fusermount'))
+            ? { ...process.env, PATH: `${wrappers}${path.delimiter}${process.env.PATH ?? ''}` }
+            : process.env;
     const result = spawnSync(
         process.execPath,
-        ['--enable-source-maps', '--test', '--test-reporter=spec', ...outFiles],
-        { stdio: 'inherit' },
+        [
+            '--enable-source-maps',
+            '--test',
+            '--test-reporter=spec',
+            ...(realFuse ? ['--test-concurrency=1'] : []),
+            ...outFiles,
+        ],
+        { stdio: 'inherit', env },
     );
     process.exit(result.status ?? 1);
 }
