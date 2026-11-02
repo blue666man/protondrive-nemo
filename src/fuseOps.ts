@@ -40,16 +40,26 @@ interface NewFileState {
     finalizeTimer: NodeJS.Timeout | null;
 }
 
-function statFor(node: NodeEntity): Fuse.Stats {
+/**
+ * Drive keeps two times per file: the server's ModifyTime
+ * (`node.modificationTime`, which also changes on rename and move) and the
+ * time the uploading client claimed for the content
+ * (`activeRevision.claimedModificationTime`, or
+ * `folder.claimedModificationTime`). mtime is the claimed time when there is
+ * one, so copies keep their times; ctime is the server time.
+ */
+export function statFor(node: NodeEntity): Fuse.Stats {
     const isFolder = node.type === NodeType.Folder;
     const size = isFolder ? 4096 : (node.activeRevision?.claimedSize ?? 0);
-    const mtime = node.modificationTime ?? new Date();
+    const serverTime = node.modificationTime ?? new Date();
+    const claimed = isFolder ? node.folder?.claimedModificationTime : node.activeRevision?.claimedModificationTime;
+    const mtime = claimed ?? serverTime;
     const uid = process.getuid ? process.getuid() : 0;
     const gid = process.getgid ? process.getgid() : 0;
     return {
         mtime,
         atime: mtime,
-        ctime: mtime,
+        ctime: serverTime,
         nlink: 1,
         size,
         mode: isFolder ? fsConstants.S_IFDIR | 0o755 : fsConstants.S_IFREG | 0o644,
