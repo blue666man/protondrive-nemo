@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { createReadStream } from 'node:fs';
-import { mkdir, rename, stat, utimes, writeFile } from 'node:fs/promises';
+import { createReadStream, mkdirSync, renameSync } from 'node:fs';
+import { rename, stat, utimes, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import {
@@ -560,11 +560,17 @@ export class PendingUploads {
                 }
                 return;
             }
-            this.byPath.delete(entry.path);
-            // Keep the uploaded content as the cached copy, as upload-on-close did.
+            // Keep the uploaded content as the cached copy, as upload-on-close did. Synchronous, and
+            // in the same turn as dropping the entry: in between, a read would find neither the
+            // entry nor the cached copy and download the file again.
             const cached = this.o.content.localPathFor(nodeUid);
-            await mkdir(path.dirname(cached), { recursive: true, mode: 0o700 }).catch(() => {});
-            await rename(entry.localPath, cached).catch(() => {});
+            try {
+                mkdirSync(path.dirname(cached), { recursive: true, mode: 0o700 });
+                renameSync(entry.localPath, cached);
+            } catch (error) {
+                this.o.logger.error(`Could not move the uploaded ${entry.path} into the content cache`, error);
+            }
+            this.byPath.delete(entry.path);
             await this.save(entry, 'remove');
             this.notify(entry, 'uploaded');
             return;
