@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { test } from 'node:test';
 
-import { ServerError, ValidationError } from '@protontech/drive-sdk';
+import { NodeWithSameNameExistsValidationError, ServerError, ValidationError } from '@protontech/drive-sdk';
 
 import { CONFLICT_STAMP, closedNewFile, type PendingSetup, setupPending } from '../pendingSetup';
 import { waitFor } from '../support';
@@ -127,4 +127,34 @@ test('a change during the upload aborts it; the new content goes up afterwards',
     await firstFlush;
     assert.equal(s.fake.uploads.length, 1);
     assert.equal(s.fake.contentOf(s.fake.uploads[0].nodeUid), 'second');
+});
+
+test('an HTTP 4xx from the server is permanent', async (t) => {
+    const s = await setupPending();
+    t.after(s.cleanup);
+    await closedNewFile(s, '/g.txt', 'g');
+    s.fake.failNextUpload(Object.assign(new ServerError('Forbidden'), { statusCode: 403 }));
+    assert.deepEqual(await s.pending.flush(), { uploaded: 0, failed: 1, retrying: 0, open: 0 });
+});
+
+test("another client's unfinished upload holding the name is waited out", async (t) => {
+    const s = await setupPending();
+    t.after(s.cleanup);
+    await closedNewFile(s, '/h.txt', 'h');
+    s.fake.failNextUpload(new NodeWithSameNameExistsValidationError('draft', 2500, undefined, true));
+    assert.deepEqual(await s.pending.flush(), { uploaded: 0, failed: 0, retrying: 1, open: 0 });
+    await waitFor(() => s.fake.uploads.length === 1, 3000, 'the retry');
+});
+
+test('an API error code we do not classify is retried, but not forever', { timeout: 5000 }, async (t) => {
+    const s = await setupPending();
+    t.after(s.cleanup);
+    await closedNewFile(s, '/i.txt', 'i');
+    for (let n = 0; n < 5; n++) {
+        s.fake.failNextUpload(Object.assign(new ServerError('odd'), { code: 2011 }));
+    }
+    for (let n = 1; n <= 4; n++) {
+        assert.equal((await s.pending.flush()).retrying, 1, `attempt ${n}`);
+    }
+    assert.deepEqual(await s.pending.flush(), { uploaded: 0, failed: 1, retrying: 0, open: 0 });
 });

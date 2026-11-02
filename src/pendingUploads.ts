@@ -7,6 +7,7 @@ import {
     DecryptionError,
     IntegrityError,
     NodeWithSameNameExistsValidationError,
+    RateLimitedError,
     ServerError,
     ValidationError,
 } from '@protontech/drive-sdk';
@@ -446,7 +447,7 @@ export class PendingUploads {
             const landed = entry.kind === 'revision' ? await this.uploadRevision(entry, options) : await this.uploadNew(entry, options);
             return { landed };
         } catch (error) {
-            return { error, permanent: isPermanent(error) };
+            return { error, permanent: isPermanent(error, entry.attempts + 1) };
         }
     }
 
@@ -696,17 +697,33 @@ export class PendingUploads {
     }
 }
 
-/** Errors a retry cannot fix: invalid input, quota, integrity or decryption failures, other 4xx, missing content. */
-function isPermanent(error: unknown): boolean {
-    if (error instanceof NodeWithSameNameExistsValidationError) {
-        return !error.isUnfinishedUpload; // another client's draft holds the name: wait it out
+/** After this many attempts, an API error code we don't classify counts as permanent. */
+const UNCLASSIFIED_ERROR_ATTEMPTS = 5;
+
+/**
+ * Errors a retry cannot fix: invalid input (quota, name, not found),
+ * integrity or decryption failures, HTTP 4xx other than 408/429, missing
+ * content. `attempt` counts this one (1 = first try).
+ */
+function isPermanent(error: unknown, attempt: number): boolean {
+    if (error instanceof NodeWithSameNameExistsValidationError && error.isUnfinishedUpload) {
+        return false; // another client's draft holds the name: wait it out
     }
     if (error instanceof ValidationError || error instanceof IntegrityError || error instanceof DecryptionError) {
         return true;
     }
-    if (error instanceof ServerError && error.statusCode !== undefined) {
-        return error.statusCode >= 400 && error.statusCode < 500 && error.statusCode !== 408 && error.statusCode !== 429;
+    if (error instanceof RateLimitedError) {
+        return false; // a ServerError with `code` 429 but no statusCode
     }
+    if (error instanceof ServerError) {
+        const status = error.statusCode;
+        if (status === undefined) {
+            // APICodeError: the API answered with a code nothing above classifies.
+            return attempt >= UNCLASSIFIED_ERROR_ATTEMPTS;
+        }
+        return status >= 400 && status < 500 && status !== 408 && status !== 429;
+    }
+    // AbortError, ConnectionError and network failures (e.g. TypeError) are transient.
     return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT';
 }
 
