@@ -53,13 +53,17 @@ export interface PendingUpload {
     cancelled: boolean;
     timer?: NodeJS.Timeout;
     abort?: AbortController;
-    /** The running attempt; resolves with the uid of a node it created if the entry was cancelled meanwhile. */
-    running?: Promise<string | undefined>;
+    /** The running attempt. */
+    running?: Promise<void>;
+    /** What the running attempt uploads to, as it was when the attempt started. */
+    target?: UploadTarget;
     changedDuringUpload: boolean;
     /** Serialises this entry's journal writes. */
     saved: Promise<void>;
     waiters: Array<(outcome: AttemptOutcome) => void>;
 }
+
+export type UploadTarget = Pick<PendingUpload, 'kind' | 'nodeUid' | 'parentUid' | 'name'>;
 
 export type AttemptOutcome = 'uploaded' | 'failed' | 'retrying' | 'stopped' | 'cancelled';
 
@@ -100,7 +104,8 @@ export interface PendingUploadsOptions {
 /** How long shutdown waits for aborted uploads to wind down before journaling anyway. */
 const ABORT_WAIT_MS = 2000;
 
-type Landed = { node?: NodeEntity; revisionUid?: string };
+/** `created`: `node` was made by this attempt (a new file or conflict copy), not found on Drive. */
+type Landed = { node?: NodeEntity; revisionUid?: string; created?: boolean };
 type Attempt = { landed: Landed } | { error: unknown; permanent: boolean };
 
 /**
@@ -252,22 +257,21 @@ export class PendingUploads {
 
     /**
      * Drops the entry at `filePath` (deleted, or replaced by a rename),
-     * aborting an upload in flight. Resolves with the uid of a Drive node
-     * that upload created anyway, so the caller can trash it.
+     * aborting an upload in flight. A node that upload created anyway is
+     * trashed.
      */
-    async cancel(filePath: string): Promise<string | undefined> {
+    async cancel(filePath: string): Promise<void> {
         const entry = this.byPath.get(filePath);
         if (!entry) {
-            return undefined;
+            return;
         }
         this.byPath.delete(filePath);
         entry.cancelled = true;
         this.clearTimer(entry);
         entry.abort?.abort();
-        const landed = await entry.running;
+        await entry.running;
         this.notify(entry, 'cancelled');
         await this.save(entry, 'remove');
-        return landed;
     }
 
     /** Uploads everything not open right now, and waits for one attempt at each. */
@@ -412,6 +416,7 @@ export class PendingUploads {
         }
         entry.state = 'uploading';
         entry.changedDuringUpload = false;
+        entry.target = { kind: entry.kind, nodeUid: entry.nodeUid, parentUid: entry.parentUid, name: entry.name };
         const abort = new AbortController();
         entry.abort = abort;
         entry.running = this.attempt(entry, abort.signal).then((result) => this.finish(entry, abort, result));
@@ -454,7 +459,8 @@ export class PendingUploads {
 
     private async uploadNew(entry: PendingUpload, options: UploadOptions): Promise<Landed> {
         try {
-            return { node: await this.o.content.uploadNewFile(entry.parentUid, entry.name, entry.localPath, options) };
+            const node = await this.o.content.uploadNewFile(entry.parentUid, entry.name, entry.localPath, options);
+            return { node, created: true };
         } catch (error) {
             if (!(error instanceof NodeWithSameNameExistsValidationError) || error.isUnfinishedUpload) {
                 throw error;
@@ -473,7 +479,8 @@ export class PendingUploads {
         for (let n = 1; n <= 5; n++) {
             const name = conflictName(entry.name, when, n);
             try {
-                return { node: await this.o.content.uploadNewFile(entry.parentUid, name, entry.localPath, options) };
+                const node = await this.o.content.uploadNewFile(entry.parentUid, name, entry.localPath, options);
+                return { node, created: true };
             } catch (error) {
                 if (!(error instanceof NodeWithSameNameExistsValidationError)) {
                     throw error;
@@ -501,25 +508,40 @@ export class PendingUploads {
         return !!remote && remote === (await sha1Of(entry.localPath));
     }
 
-    private async finish(entry: PendingUpload, abort: AbortController, result: Attempt): Promise<string | undefined> {
+    private async finish(entry: PendingUpload, abort: AbortController, result: Attempt): Promise<void> {
         entry.abort = undefined;
         if ('landed' in result) {
-            const { node, revisionUid } = result.landed;
-            const nodeUid = node?.uid ?? (entry.nodeUid as string);
+            const { node, revisionUid, created } = result.landed;
+            const target = entry.target as UploadTarget;
+            const nodeUid = node?.uid ?? (target.nodeUid as string);
             if (node) {
                 this.o.tree.rememberNode(node);
             }
-            this.o.tree.invalidate(entry.parentUid);
-            if (entry.cancelled) {
-                return node?.uid;
-            }
-            if (entry.changedDuringUpload) {
-                // Landed, but the file changed meanwhile: the change becomes a revision of what landed.
-                entry.kind = 'revision';
-                entry.nodeUid = nodeUid;
-                entry.baseRevisionUid = revisionUid ?? node?.activeRevision?.uid;
-                this.afterChange(entry);
-                return undefined;
+            this.o.tree.invalidate(target.parentUid, entry.parentUid);
+            if (entry.cancelled || entry.changedDuringUpload) {
+                // The upload landed although it was aborted: the server had already committed it.
+                const sameTarget =
+                    entry.kind === target.kind &&
+                    entry.nodeUid === target.nodeUid &&
+                    entry.parentUid === target.parentUid &&
+                    entry.name === target.name;
+                const otherNode = node && node.uid !== target.nodeUid;
+                if (otherNode && (entry.cancelled || !sameTarget)) {
+                    // A node under a name or for a change that no longer exists (e.g. rsync's temp
+                    // file, renamed meanwhile). Only one this attempt made: a found one isn't ours.
+                    if (created) {
+                        await this.trashLanded(node, target.parentUid);
+                    }
+                } else if (!entry.cancelled && (sameTarget || entry.nodeUid === nodeUid)) {
+                    // The change becomes a revision of what landed.
+                    entry.kind = 'revision';
+                    entry.nodeUid = nodeUid;
+                    entry.baseRevisionUid = revisionUid ?? node?.activeRevision?.uid;
+                }
+                if (!entry.cancelled) {
+                    this.afterChange(entry);
+                }
+                return;
             }
             this.byPath.delete(entry.path);
             // Keep the uploaded content as the cached copy, as upload-on-close did.
@@ -528,21 +550,21 @@ export class PendingUploads {
             await rename(entry.localPath, cached).catch(() => {});
             await this.save(entry, 'remove');
             this.notify(entry, 'uploaded');
-            return undefined;
+            return;
         }
 
         if (entry.cancelled) {
-            return undefined;
+            return;
         }
         if (entry.changedDuringUpload) {
             this.afterChange(entry);
-            return undefined;
+            return;
         }
         if (abort.signal.aborted) {
             // Shutdown: the journal carries it to the next mount.
             entry.state = 'stopped';
             this.notify(entry, 'stopped');
-            return undefined;
+            return;
         }
         entry.error = result.error instanceof Error ? result.error.message : String(result.error);
         if (result.permanent) {
@@ -550,7 +572,7 @@ export class PendingUploads {
             this.o.logger.error(`Upload of ${entry.path} failed; kept locally until it is changed, renamed or deleted`, result.error);
             void this.save(entry);
             this.notify(entry, 'failed');
-            return undefined;
+            return;
         }
         entry.attempts++;
         const delay = Math.min((this.o.retryBaseMs ?? 1000) * 2 ** (entry.attempts - 1), this.o.retryMaxMs ?? 300_000);
@@ -562,7 +584,22 @@ export class PendingUploads {
             entry.timer.unref();
         }
         this.notify(entry, 'retrying');
-        return undefined;
+        return;
+    }
+
+    private async trashLanded(node: NodeEntity, parentUid: string): Promise<void> {
+        try {
+            for await (const result of this.o.sdk.trashNodes([node.uid])) {
+                if (!result.ok) {
+                    throw result.error;
+                }
+            }
+        } catch (error) {
+            this.o.logger.error(`Could not trash ${node.uid}, uploaded under a name no longer in use`, error);
+        }
+        this.o.tree.forgetNode(node.uid);
+        this.o.tree.invalidate(parentUid);
+        await this.o.content.forget(node.uid).catch(() => {});
     }
 
     private afterChange(entry: PendingUpload): void {

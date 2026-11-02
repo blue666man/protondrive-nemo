@@ -62,6 +62,12 @@ export class FakeDrive {
     readonly uploads: UploadRecord[] = [];
     /** Uploads between uploadFromStream() and the end of completion(). */
     inFlight = 0;
+    /**
+     * A held upload ignores its abort signal: it waits for release, then
+     * commits and succeeds, as when the server finishes an upload just as
+     * the client aborts it.
+     */
+    commitDespiteAbort = false;
 
     private readonly nodes = new Map<string, FakeNode>();
     private nextId = 1;
@@ -288,10 +294,13 @@ export class FakeDrive {
     }
 
     private async waitForRelease(signal?: AbortSignal): Promise<void> {
+        const hold = this.hold;
+        if (hold && this.commitDespiteAbort) {
+            return hold;
+        }
         if (signal?.aborted) {
             throw new AbortError();
         }
-        const hold = this.hold;
         if (!hold) {
             return;
         }
