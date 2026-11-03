@@ -1,6 +1,9 @@
 import { chmod, mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 
+/** What a journal id looks like (ours are UUIDs): nothing that can leave the directory. */
+const VALID_ID = /^[A-Za-z0-9-]+$/;
+
 export type PendingKind = 'new' | 'revision';
 
 /** One upload that has not reached Drive yet, as stored on disk. */
@@ -93,6 +96,10 @@ export class PendingJournal {
                 continue;
             }
             const id = name.slice(0, -'.json'.length);
+            if (!VALID_ID.test(id)) {
+                problems.push(`Pending-upload record ${name} has an invalid name; skipped`);
+                continue;
+            }
             let record: JournalRecord;
             try {
                 record = JSON.parse(await readFile(full, 'utf8')) as JournalRecord;
@@ -106,7 +113,8 @@ export class PendingJournal {
                 problems.push(`Pending upload of ${record.path} has no content (already uploaded, or lost); record dropped`);
                 continue;
             }
-            records.push(record);
+            // The file name is the id: a record can't point at another entry's files.
+            records.push({ ...record, id });
         }
         return { records, problems };
     }

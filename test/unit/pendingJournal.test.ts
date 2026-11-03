@@ -73,3 +73,20 @@ test('an unreadable record is moved aside and its content kept, also on the next
     await journal.loadAll();
     assert.deepEqual(readdirSync(journal.dir).sort(), ['c.blob', 'c.json.corrupt']);
 });
+
+test('a record is loaded under its file name, whatever id its content claims', { timeout: 5000 }, async (t) => {
+    const journal = await journalIn(t);
+    writeFileSync(journal.blobPath('good'), 'content');
+    writeFileSync(path.join(journal.dir, 'good.json'), JSON.stringify(record('../x')));
+    assert.deepEqual(await journal.loadAll(), { records: [record('good', { path: '/../x.txt', name: '../x.txt' })], problems: [] });
+});
+
+test('a record whose file name is not a valid id is skipped with a problem', { timeout: 5000 }, async (t) => {
+    const journal = await journalIn(t);
+    writeFileSync(path.join(journal.dir, 'not_an id.blob'), 'content');
+    writeFileSync(path.join(journal.dir, 'not_an id.json'), JSON.stringify(record('a')));
+    const { records, problems } = await journal.loadAll();
+    assert.deepEqual(records, []);
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /not_an id\.json/);
+});

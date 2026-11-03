@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { test } from 'node:test';
 
@@ -157,4 +157,17 @@ test('an API error code we do not classify is retried, but not forever', { timeo
         assert.equal((await s.pending.flush()).retrying, 1, `attempt ${n}`);
     }
     assert.deepEqual(await s.pending.flush(), { uploaded: 0, failed: 1, retrying: 0, open: 0 });
+});
+
+test('a revision blob is private even under umask 022', { timeout: 5000 }, async (t) => {
+    const previous = process.umask(0o022);
+    t.after(() => process.umask(previous));
+    const s = await setupPending();
+    t.after(s.cleanup);
+    const uid = s.fake.addFile(s.fake.rootUid, 'r.txt', 'old');
+    const node = await s.fake.client.getNode(uid);
+    await s.content.ensureDownloaded(node);
+    const entry = s.pending.beginRevision('/r.txt', node, s.fake.rootUid, 'r.txt', 1);
+    await entry.ready;
+    assert.equal(statSync(entry.localPath).mode & 0o777, 0o600);
 });

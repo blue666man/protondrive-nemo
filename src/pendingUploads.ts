@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, mkdirSync, renameSync } from 'node:fs';
-import { rename, stat, utimes, writeFile } from 'node:fs/promises';
+import { chmod, rename, stat, utimes, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import {
@@ -188,7 +188,10 @@ export class PendingUploads {
             refCount,
             state: 'open',
         });
-        entry.ready = rename(this.o.content.localPathFor(node.uid), entry.localPath);
+        // The cache's copy was created under the umask; pending content is ours alone.
+        entry.ready = rename(this.o.content.localPathFor(node.uid), entry.localPath).then(() =>
+            chmod(entry.localPath, 0o600),
+        );
         entry.ready.catch((error) => this.o.logger.error(`Could not move ${name} into the pending dir`, error));
         if (refCount === 0) {
             this.settle(entry);
