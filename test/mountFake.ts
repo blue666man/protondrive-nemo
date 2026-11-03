@@ -35,6 +35,7 @@ export async function mountFake(
     t.after(async () => {
         await handle.pending.shutdown(handle.shutdownGraceMs);
         await handle.ipc.stop();
+        await handle.releaseLock();
         tmp.cleanup();
     });
     return { fake, handle, cacheDir, op: (name, ...args) => callOp(ops[name], ...args) };

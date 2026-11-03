@@ -6,6 +6,7 @@ import Fuse from '@cocalc/fuse-native';
 import { ContentStore } from './contentStore';
 import { DriveTree } from './driveTree';
 import { createFuseOperations } from './fuseOps';
+import { acquireInstanceLock } from './instanceLock';
 import { IpcServer, socketPathFor } from './ipcServer';
 import { PendingJournal } from './pendingJournal';
 import { PendingUploads } from './pendingUploads';
@@ -23,6 +24,8 @@ export interface MountHandle {
     ipc: IpcServer;
     pending: PendingUploads;
     shutdownGraceMs: number;
+    /** Releases the one-daemon-per-account lock; call it last, after unmounting. */
+    releaseLock: () => Promise<void>;
 }
 
 /** Whole milliseconds from environment variable `name`, or `fallback` when it is unset. */
@@ -63,27 +66,43 @@ export async function mount(
         logger: drive.logger,
         settleMs,
     });
-    // Before mounting, so files left over from the last run are visible from the start.
-    await pending.resume();
-    const { ops, hasUnsavedChanges } = createFuseOperations(drive.sdk, tree, content, pending, drive.logger);
+    // Before the journal is loaded: a second daemon would take the first
+    // one's open files for leftovers and delete them.
+    const releaseLock = await acquireInstanceLock(drive.config.cacheDir);
+    let fuse: Fuse | undefined;
+    try {
+        // Before mounting, so files left over from the last run are visible from the start.
+        await pending.resume();
+        const { ops, hasUnsavedChanges } = createFuseOperations(drive.sdk, tree, content, pending, drive.logger);
 
-    const isDefaultProfile = drive.config.profile === 'default';
-    const fuse = new Fuse(mountPoint, ops, {
-        force: true,
-        mkdir: true,
-        fsname: isDefaultProfile ? 'protondrive-nemo' : `protondrive-nemo-${drive.config.profile}`,
-        displayFolder: isDefaultProfile ? 'Proton Drive' : `Proton Drive (${drive.config.profile})`,
-        debug: process.env.PROTONDRIVE_NEMO_FUSE_DEBUG === '1',
-    });
+        const isDefaultProfile = drive.config.profile === 'default';
+        const mounting = new Fuse(mountPoint, ops, {
+            force: true,
+            mkdir: true,
+            fsname: isDefaultProfile ? 'protondrive-nemo' : `protondrive-nemo-${drive.config.profile}`,
+            displayFolder: isDefaultProfile ? 'Proton Drive' : `Proton Drive (${drive.config.profile})`,
+            debug: process.env.PROTONDRIVE_NEMO_FUSE_DEBUG === '1',
+        });
+        await new Promise<void>((resolve, reject) => {
+            mounting.mount((err) => (err ? reject(err) : resolve()));
+        });
+        fuse = mounting;
 
-    await new Promise<void>((resolve, reject) => {
-        fuse.mount((err) => (err ? reject(err) : resolve()));
-    });
+        const ipc = new IpcServer(socketPathFor(drive.config.cacheDir), tree, content, hasUnsavedChanges, drive.logger, pending);
+        await ipc.start();
 
-    const ipc = new IpcServer(socketPathFor(drive.config.cacheDir), tree, content, hasUnsavedChanges, drive.logger, pending);
-    await ipc.start();
-
-    return { fuse, ipc, pending, shutdownGraceMs };
+        return { fuse, ipc, pending, shutdownGraceMs, releaseLock };
+    } catch (err) {
+        // Undo what was started, so the lock is not released under running uploads or a live mount.
+        if (fuse) {
+            const mounted = fuse;
+            await new Promise<void>((resolve) => mounted.unmount(() => resolve()));
+        }
+        // Resumed uploads stop and stay in the journal.
+        await pending.shutdown(0).catch(() => {});
+        await releaseLock();
+        throw err;
+    }
 }
 
 export async function unmount(mountPoint: string): Promise<void> {

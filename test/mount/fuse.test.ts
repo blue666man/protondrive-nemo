@@ -42,6 +42,7 @@ after(async () => {
     await new Promise<void>((resolve, reject) =>
         handle.fuse.unmount((err) => (err ? reject(err) : resolve())),
     );
+    await handle.releaseLock();
     tmp.cleanup();
 });
 

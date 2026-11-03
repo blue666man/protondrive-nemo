@@ -46,6 +46,7 @@ test('getattr on the mount reports the claimed time of a file on Drive', async (
     const handle = await mount({ ...fakeDrive(path.join(tmp.dir, 'cache')), sdk: fake.client }, path.join(tmp.dir, 'mnt'));
     t.after(async () => {
         await handle.ipc.stop();
+        await handle.releaseLock();
         tmp.cleanup();
     });
     const [err, st] = (await callOp(Fuse.last().ops.getattr, '/old.txt')) as [number, { mtime: Date }];
