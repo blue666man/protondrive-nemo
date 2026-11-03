@@ -1,6 +1,6 @@
 # Preserving file modification times (claimed mtime) — Design
 
-Status: proposal
+Status: implemented
 
 ## Goal
 
@@ -132,6 +132,8 @@ what gets uploaded. This generalises the existing 500 ms grace window for empty 
 | `truncate`/`write` while pending | local; still pending |
 | `unlink` while pending | new file: cancel. Revision: cancel, then trash as usual |
 | timer fires | upload once, under the final name, with claimed mtime = `stat(localPath).mtime` |
+| `truncate` (no handle) of a committed file | becomes a pending revision (it used to change only the local copy) |
+| `rmdir` of a non-empty folder | `ENOTEMPTY` (it used to trash the folder with its contents) |
 
 Notes:
 
@@ -144,7 +146,8 @@ Notes:
   pretending to apply them would hide that from the caller. `EPERM` (rather than
   today's `ENOSYS`) states the refusal is deliberate, and `cp -p` already tolerates
   `EPERM` from `chown`. Consequence: sync with `rsync -rlt` (or `-a --no-perms
-  --no-owner --no-group`); plain `rsync -a` still exits 23 on the permission step.
+  --no-owner --no-group`); plain `rsync -a` copies nothing (rsync drops each file
+  when `fchmod` of its temp file fails) and exits 23.
 - For folders, the claimed time can only be set by `createFolder`, which happens at
   `mkdir` (`src/fuseOps.ts:413`), before rsync knows the time. A later `utimens` on a
   folder is accepted and ignored, like any committed node.
@@ -153,12 +156,18 @@ Notes:
 
 **Journal.**
 
-- `pending.json` in the profile's cache dir, written atomically (write a temporary file,
-  fsync, rename) and fsynced:
+- One record per pending upload, `pending/<id>.json`, beside its content
+  `pending/<id>.blob`. Each record is written atomically (temp file, fsync,
+  rename, directory fsync). A single shared file would be rewritten on every
+  closed file, which is O(n²) bytes for an rsync of n files.
 
   ```
-  { id, kind, parentUid, name, nodeUid?, baseRevisionUid?, blob, claimedMtime, attempts, state }
+  { id, kind, path, parentUid, name, nodeUid?, baseRevisionUid?, claimedMtime, attempts, state, error? }
   ```
+
+- A file is journaled when its last handle closes. On the next start,
+  content without a record (never closed) is deleted, and a record without
+  content is dropped.
 
 - Blobs live in a `pending/` dir beside `blobs/` (`src/mount.ts:24`). Neither the
   whole-cache clear action, which only empties `blobs/`
@@ -189,10 +198,14 @@ uploads stay in the journal.
 - A new `protondrive-nemo flush` command uploads everything pending and waits, for
   scripts that need the data on Drive before they continue.
 
-**Conflicts on replay.**
+**Conflicts.**
 
+- The check runs before **every** revision upload, not only on replay: one `getNode`
+  per revision, which also catches edits made elsewhere during the settle window.
 - A revision whose node's current revision ≠ `baseRevisionUid`, or a new file whose name
   now exists: upload as `name (conflict YYYY-MM-DD HHMM).ext`.
+- A revision of a file that was deleted (or trashed) on Drive meanwhile is uploaded as a
+  new file.
 - If the remote revision's `claimedDigests.sha1` equals the blob's SHA-1, the upload had
   already landed before the journal was updated: drop the entry instead.
 - Never silently overwrite remote changes.
@@ -220,8 +233,8 @@ All three tiers are part of the change. The repository has no tests today.
 **Tier 2: real kernel FUSE with FakeDrive** (`test/mount`, `npm run test:mount`):
 
 - needs `/dev/fuse` and the native modules;
-- runs real `rsync -rlt` twice (the second run uploads nothing), `rsync -a` (asserting
-  only the expected permission errors), `cp -p`, `touch -d`, `mv`
+- runs real `rsync -rlt` twice (the second run uploads nothing), `rsync -a` (which
+  copies nothing and exits 23), `cp -p`, `touch -d`, `mv`
   across folders and an editor-style save;
 - asserts one upload per file, the right name and the right claimed time.
 
@@ -235,6 +248,12 @@ never in CI):
   time;
 - times persist across a remount;
 - killing the daemon inside the settle window, then remounting, replays the upload.
+
+**Dependency bug.** `@cocalc/fuse-native` ≤ 2.4.3 passes atime as mtime to `utimens`
+([sagemathinc/fuse-native#3](https://github.com/sagemathinc/fuse-native/issues/3)), so
+every `rsync -t` and `cp -p` would claim "now". This change needs the one-word fix
+(`l->atime` → `l->mtime` in the second `FUSE_UINT64_TO_INTS_ARGV` of the `utimens`
+method in `fuse-native.c`); tier 2 checks for it.
 
 **Development environment.** Node 22, libfuse 2 headers, a C toolchain;
 `npm ci --ignore-scripts` then `npm rebuild @cocalc/fuse-native better-sqlite3`. Tier 2
