@@ -36,7 +36,7 @@ export interface UploadOptions {
 
 /**
  * Materializes Drive file content to local disk on demand (download on
- * first open, upload on release-if-dirty), instead of implementing
+ * first open; changes are uploaded through pendingUploads.ts), instead of implementing
  * byte-range paging against the remote. Simple and reliable for a v1; the
  * tradeoff is that opening a very large file downloads it in full before
  * any byte is readable — see README limitations.

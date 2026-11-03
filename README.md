@@ -98,6 +98,16 @@ In another terminal (or Ctrl+C the `mount` process to unmount):
 node dist/cli.js unmount
 ```
 
+`unmount` asks the running mount daemon to shut down over its control
+socket: uploads still running get the shutdown grace period (see below), the
+rest stay pending and upload on the next `mount`. If no daemon answers (it
+crashed or was killed), `unmount` just detaches the mount it left behind.
+
+Only one mount daemon runs per account: a second `mount` for the same
+account refuses to start (`already running for this account (pid N)`), as
+the two would share one pending-upload journal. The lock is `daemon.lock` in
+the account's cache dir; a lock left by a process that is gone is taken over.
+
 Other commands: `node dist/cli.js status`, `node dist/cli.js logout`.
 
 Add `-m /custom/path` to `mount`/`unmount`/`status`/`evict` to use a
@@ -282,9 +292,11 @@ src/driveTree.ts          FUSE path <-> Drive node UID resolution + short-lived 
 src/contentStore.ts        local blob cache: download-on-open
 src/pendingUploads.ts      changes not on Drive yet: settle window, conflicts, retries, shutdown
 src/pendingJournal.ts      durable per-upload records beside their content (pending/)
-src/ipcServer.ts            Unix-socket control channel for the `evict` CLI command
-                            and the cache-status Nemo extension to talk to the
-                            running mount daemon
+src/ipcServer.ts            Unix-socket control channel to the running mount daemon:
+                            `evict`, the cache-status Nemo extension (`cacheStatus`),
+                            and `flush`, `pendingStatus` (`status`) and `shutdown` (`unmount`)
+src/shutdown.ts             the daemon's one guarded shutdown (signals and `unmount`)
+src/instanceLock.ts         one mount daemon per account (`daemon.lock`)
 nemo-extension/             nemo-python extension: cache-status emblem + list-view
                             column (see install-nemo-cache-emblems.sh)
 src/sdk-bootstrap/         bootstraps @protontech/drive-sdk's ProtonDriveClient:

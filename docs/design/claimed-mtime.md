@@ -175,27 +175,37 @@ Notes:
   journal references it.
 - `baseRevisionUid` is the node's active revision when the revision became pending.
 
-**Shutdown is bounded.** On unmount, SIGINT or SIGTERM (handled today at
-`src/cli.ts:99-110`):
+**One daemon per account.** Two daemons on one cache dir would share the journal, and
+the second would delete the first one's open files as leftovers. Before it loads the
+journal, `mount()` takes `<cacheDir>/daemon.lock` (`src/instanceLock.ts`), which holds its
+pid: a second `mount` for the same account fails with `already running for this account
+(pid N)`, and a lock whose process is gone is taken over. Any failure after that point
+releases the lock again; shutdown releases it last.
+
+**Shutdown is bounded.** SIGINT, SIGTERM and `protondrive-nemo unmount` all run one
+guarded shutdown (`src/shutdown.ts`, wired in `src/cli.ts`); a second request only logs
+`Already shutting down…`. `unmount` asks the daemon over the IPC socket
+(`{ op: 'shutdown' }`), and the daemon replies once the uploads are journalled. If no
+daemon answers, `unmount` falls back to `Fuse.unmount`.
 
 1. stop starting uploads;
 2. give in-flight uploads a grace period (10 s, `PROTONDRIVE_NEMO_SHUTDOWN_GRACE_MS`), then
    abort them via `AbortSignal`;
-3. fsync the journal;
-4. unmount.
+3. fsync the journal (the IPC reply, with the number left pending, goes out here);
+4. stop the IPC server, unmount, release the instance lock, close the session.
 
-Nothing hangs on a large backlog, even at system shutdown. Aborted and not-yet-started
-uploads stay in the journal.
+Each step in 4 runs even if an earlier one failed; the exit code is 0 only if all of them
+succeeded. Nothing hangs on a large backlog, even at system shutdown. Aborted and
+not-yet-started uploads stay in the journal.
 
 **Resume, status and flush.**
 
-- The next `mount` replays the journal in the background.
-- `protondrive-nemo unmount` prints how many uploads are pending, and
-  `protondrive-nemo status` shows pending and failed counts. Both ask the running daemon
-  over the existing IPC socket (`src/ipcServer.ts`) through a new request type; today
-  `status` (`src/cli.ts:74-86`) reports only login state and the mount point, and
-  `unmount` (`src/cli.ts:113-123`) calls `Fuse.unmount` directly.
-- A new `protondrive-nemo flush` command uploads everything pending and waits, for
+- The next `mount` loads the journal before it mounts, so files left pending are visible
+  from the start; their uploads then run in the background.
+- `protondrive-nemo unmount` prints how many uploads are still pending after shutdown,
+  and `protondrive-nemo status` shows pending and failed counts. Both ask the running
+  daemon over the IPC socket (`src/ipcServer.ts`: `shutdown`, `pendingStatus`).
+- `protondrive-nemo flush` (IPC `flush`) uploads everything pending and waits, for
   scripts that need the data on Drive before they continue.
 
 **Conflicts.**
