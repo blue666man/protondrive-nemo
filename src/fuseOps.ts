@@ -166,6 +166,42 @@ export function createFuseOperations(
         }
     }
 
+    /** The Drive node at `path`, or undefined if there is none. Any other failure propagates (EIO). */
+    async function resolveIfExists(path: string): Promise<NodeEntity | undefined> {
+        try {
+            return await tree.resolve(path);
+        } catch (err) {
+            if (err instanceof NodeNotFoundError) {
+                return undefined;
+            }
+            throw err;
+        }
+    }
+
+    /** True if folder `uid` holds anything, on Drive or pending. */
+    async function hasChildren(uid: string): Promise<boolean> {
+        return (await tree.listChildren(uid)).size > 0 || pending.inFolder(uid).length > 0;
+    }
+
+    /**
+     * Throws unless rename() may replace what is at `dest` (Drive node
+     * `existing`, or else a pending file): only a file may replace a file,
+     * and only a folder an empty folder. Drive would trash a folder with
+     * everything in it.
+     */
+    async function checkReplaceable(srcIsFolder: boolean, dest: string, existing: NodeEntity | undefined): Promise<void> {
+        const destIsFolder = existing?.type === NodeType.Folder;
+        if (destIsFolder && !srcIsFolder) {
+            throw errnoError('EISDIR', `${dest} is a folder`);
+        }
+        if (!destIsFolder && srcIsFolder) {
+            throw errnoError('ENOTDIR', `${dest} is not a folder`);
+        }
+        if (destIsFolder && (await hasChildren(existing.uid))) {
+            throw errnoError('ENOTEMPTY', `${dest} is not empty`);
+        }
+    }
+
     async function trash(uid: string): Promise<void> {
         await drain(sdk.trashNodes([uid]));
         tree.forgetNode(uid);
@@ -447,9 +483,8 @@ export function createFuseOperations(
                 const [node, { parent }] = await Promise.all([tree.resolve(path), tree.resolveParent(path)]);
                 // Drive trashes a folder together with everything in it; rmdir
                 // must only ever remove an empty one.
-                const children = await tree.listChildren(node.uid);
-                if (children.size > 0 || pending.inFolder(node.uid).length > 0) {
-                    throw Object.assign(new Error(`${path} is not empty`), { code: 'ENOTEMPTY' });
+                if (await hasChildren(node.uid)) {
+                    throw errnoError('ENOTEMPTY', `${path} is not empty`);
                 }
                 await drain(sdk.trashNodes([node.uid]));
                 tree.forgetNode(node.uid);
@@ -472,6 +507,10 @@ export function createFuseOperations(
                     // renames while its write handle is still open). The
                     // rename stays local; the upload goes out under the final
                     // name.
+                    const existing = destEntry ? undefined : await resolveIfExists(dest);
+                    if (destEntry || existing) {
+                        await checkReplaceable(false, dest, existing);
+                    }
                     let revisionOf: { nodeUid: string; baseRevisionUid?: string } | undefined;
                     detachHandles(dest);
                     if (destEntry) {
@@ -479,15 +518,12 @@ export function createFuseOperations(
                             revisionOf = { nodeUid: destEntry.nodeUid, baseRevisionUid: destEntry.baseRevisionUid };
                         }
                         await cancelPending(dest);
-                    } else {
-                        const existing = await tree.resolve(dest).catch(() => undefined);
-                        if (existing) {
-                            // Replacing a file already on Drive: upload a new
-                            // revision of it, keeping its history, rather than
-                            // trashing it and starting over.
-                            revisionOf = { nodeUid: existing.uid, baseRevisionUid: existing.activeRevision?.uid };
-                            await content.forget(existing.uid);
-                        }
+                    } else if (existing) {
+                        // Replacing a file already on Drive: upload a new
+                        // revision of it, keeping its history, rather than
+                        // trashing it and starting over.
+                        revisionOf = { nodeUid: existing.uid, baseRevisionUid: existing.activeRevision?.uid };
+                        await content.forget(existing.uid);
                     }
                     pending.move(src, dest, destCtx.parent.uid, destCtx.name, revisionOf);
                     retargetHandles(src, dest, destCtx.parent.uid, destCtx.name);
@@ -495,13 +531,18 @@ export function createFuseOperations(
                 }
 
                 const [node, srcCtx] = await Promise.all([tree.resolve(src), tree.resolveParent(src)]);
+                // POSIX rename() atomically replaces an existing destination. A
+                // pending one is a file; its Drive node, if any, is the file it revises.
+                const found = await resolveIfExists(dest);
+                const existingDest = found && found.uid !== node.uid ? found : undefined;
+                if (destEntry || existingDest) {
+                    await checkReplaceable(node.type === NodeType.Folder, dest, existingDest);
+                }
                 detachHandles(dest);
                 if (destEntry) {
                     await cancelPending(dest);
                 }
-                // POSIX rename() atomically replaces an existing destination.
-                const existingDest = await tree.resolve(dest).catch(() => undefined);
-                if (existingDest && existingDest.uid !== node.uid) {
+                if (existingDest) {
                     await trash(existingDest.uid);
                 }
                 if (srcCtx.parent.uid !== destCtx.parent.uid) {
@@ -532,6 +573,11 @@ async function drain(iterable: AsyncIterable<unknown>): Promise<void> {
     for await (const _item of iterable) {
         // Consume the async generator so the operation actually executes.
     }
+}
+
+/** A local error that errnoFor() maps to errno `code`. */
+function errnoError(code: string, message: string): Error {
+    return Object.assign(new Error(message), { code });
 }
 
 function errnoFor(err: unknown): number {
