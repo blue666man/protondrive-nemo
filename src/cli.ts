@@ -10,6 +10,7 @@ import type { FlushResult, PendingStatus } from './pendingUploads';
 import { getConfig } from './sdk-bootstrap/config';
 import { initDrive } from './sdk-bootstrap/init';
 import { mount, unmount } from './mount';
+import { guardedShutdown } from './shutdown';
 
 const APP_VERSION = 'external-drive-protondrive_nemo@0.1.0-alpha';
 const DISCLOSURE = 'protondrive-nemo is a third-party application, not officially supported by Proton.';
@@ -107,39 +108,56 @@ program
         const { fuse, ipc, pending, shutdownGraceMs, releaseLock } = await mount(d, mountPoint);
         console.log(`Mounted Proton Drive at ${mountPoint}`);
 
-        const shutdown = async () => {
-            console.log('\nUnmounting...');
-            // Bounded: running uploads get the grace period, the rest wait in
-            // the journal for the next mount.
-            const remaining = await pending.shutdown(shutdownGraceMs);
-            if (remaining > 0) {
-                console.log(`${remaining} upload(s) still pending; they resume on the next mount.`);
-            }
-            await ipc.stop();
-            await new Promise<void>((resolve) => fuse.unmount((err) => {
-                if (err) console.error('Unmount failed:', err);
-                resolve();
-            }));
-            await releaseLock();
-            await d.dispose();
-            process.exit(0);
+        // Bounded: running uploads get the grace period, the rest wait in
+        // the journal for the next mount.
+        const shutdown = guardedShutdown({
+            drain: () => pending.shutdown(shutdownGraceMs),
+            steps: [
+                ['stop the control socket', () => ipc.stop()],
+                ['unmount', () => new Promise<void>((resolve, reject) => fuse.unmount((err) => (err ? reject(err) : resolve())))],
+                ['release the instance lock', releaseLock],
+                ['close the session', () => d.dispose()],
+            ],
+        });
+        const onSignal = (signal: string) => {
+            void shutdown(signal).done.then((code) => process.exit(code));
         };
-        process.once('SIGINT', shutdown);
-        process.once('SIGTERM', shutdown);
+        process.on('SIGINT', onSignal);
+        process.on('SIGTERM', onSignal);
+        // `protondrive-nemo unmount`: answered once the uploads are journalled.
+        ipc.onShutdown = () => {
+            const run = shutdown('unmount requested');
+            void run.done.then((code) => process.exit(code));
+            return run.drained;
+        };
     });
 
 program
     .command('unmount')
-    .description('Unmount Proton Drive')
+    .description('Unmount Proton Drive: stops the mount daemon (pending uploads get a grace period, then wait for the next mount)')
     .option(...ACCOUNT_OPTION)
     .option('-m, --mount-point <path>', 'mount point')
     .action(async (opts: { account?: string; mountPoint?: string }) => {
         const mountPoint = opts.mountPoint ?? defaultMountPointFor(opts.account);
-        const pending = await pendingStatus(opts.account);
-        await unmount(mountPoint);
+        let res: { ok: boolean; error?: string; remaining?: number };
+        try {
+            res = await sendRequest(socketFor(opts.account), { op: 'shutdown' });
+        } catch (err) {
+            res = { ok: false, error: errorCode(err) };
+        }
+        if (res.error === 'mount-not-running') {
+            // No daemon (crashed, or killed): just detach a mount left behind.
+            await unmount(mountPoint);
+            console.log(`Unmounted ${mountPoint}`);
+            process.exit(0);
+        }
+        if (!res.ok) {
+            console.error(`unmount: ${describeEvictError(res.error)}`);
+            process.exit(1);
+        }
         console.log(`Unmounted ${mountPoint}`);
-        if (pending && pendingCount(pending) > 0) {
-            console.log(`${pendingCount(pending)} upload(s) still pending; they resume on the next mount.`);
+        if (res.remaining) {
+            console.log(`${res.remaining} upload(s) still pending; they resume on the next mount.`);
         }
         process.exit(0);
     });

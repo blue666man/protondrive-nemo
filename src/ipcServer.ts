@@ -26,7 +26,8 @@ export type IpcRequest =
     | { op: 'evict'; path: string }
     | { op: 'cacheStatus'; path: string }
     | { op: 'pendingStatus' }
-    | { op: 'flush' };
+    | { op: 'flush' }
+    | { op: 'shutdown' };
 
 interface PendingStatusResponse {
     ok: boolean;
@@ -40,7 +41,14 @@ interface FlushResponse {
     result?: FlushResult;
 }
 
-type Response = EvictResponse | CacheStatusResponse | PendingStatusResponse | FlushResponse;
+interface ShutdownResponse {
+    ok: boolean;
+    error?: string;
+    /** Uploads left in the journal for the next mount. */
+    remaining?: number;
+}
+
+type Response = EvictResponse | CacheStatusResponse | PendingStatusResponse | FlushResponse | ShutdownResponse;
 
 /**
  * Wall-clock budget for a single cacheStatus request, covering every
@@ -88,6 +96,8 @@ export function sendRequest<T = unknown>(socketPath: string, request: IpcRequest
         socket.on('error', (err: NodeJS.ErrnoException) => {
             reject(new Error(err.code === 'ENOENT' || err.code === 'ECONNREFUSED' ? 'mount-not-running' : err.message));
         });
+        // The daemon went away without answering (no-op once resolved).
+        socket.on('close', () => reject(new Error('no-answer')));
     });
 }
 
@@ -100,6 +110,14 @@ export function sendRequest<T = unknown>(socketPath: string, request: IpcRequest
  */
 export class IpcServer {
     private server?: Server;
+    /** Open client connections; stop() ends them, so a silent client can't hold it up. */
+    private readonly sockets = new Set<Socket>();
+
+    /**
+     * Answers `{ op: 'shutdown' }`: shuts the daemon down and resolves with
+     * the number of uploads left for the next mount. Set by the CLI.
+     */
+    onShutdown?: () => Promise<number>;
 
     constructor(
         private readonly socketPath: string,
@@ -123,12 +141,19 @@ export class IpcServer {
     async stop(): Promise<void> {
         const server = this.server;
         if (server) {
-            await new Promise<void>((resolve) => server.close(() => resolve()));
+            const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+            for (const socket of this.sockets) {
+                socket.destroy();
+            }
+            this.sockets.clear();
+            await closed;
         }
         await unlink(this.socketPath).catch(() => {});
     }
 
     private handleConnection(socket: Socket): void {
+        this.sockets.add(socket);
+        socket.on('close', () => this.sockets.delete(socket));
         let buffer = '';
         socket.on('data', (chunk) => {
             buffer += chunk.toString('utf8');
@@ -146,18 +171,29 @@ export class IpcServer {
         if (!line.trim()) {
             return;
         }
-        this.handleRequest(line)
+        let req: IpcRequest | undefined;
+        Promise.resolve()
+            .then(() => {
+                req = JSON.parse(line) as IpcRequest;
+                return this.handleRequest(req);
+            })
             .catch((err): Response => ({
                 ok: false,
                 error: err instanceof NodeNotFoundError ? 'not-found' : err instanceof Error ? err.message : String(err),
             }))
             .then((res) => {
+                if (req?.op === 'shutdown' && res.ok) {
+                    // The daemon stops the server next: answer and close
+                    // gracefully, out of stop()'s reach.
+                    this.sockets.delete(socket);
+                    socket.end(`${JSON.stringify(res)}\n`);
+                    return;
+                }
                 socket.write(`${JSON.stringify(res)}\n`);
             });
     }
 
-    private async handleRequest(line: string): Promise<Response> {
-        const req = JSON.parse(line) as IpcRequest;
+    private async handleRequest(req: IpcRequest): Promise<Response> {
         if (req.op === 'evict') {
             return this.handleEvict(req.path);
         }
@@ -169,6 +205,12 @@ export class IpcServer {
         }
         if (req.op === 'flush') {
             return { ok: true, result: await this.pending.flush() };
+        }
+        if (req.op === 'shutdown') {
+            if (!this.onShutdown) {
+                return { ok: false, error: 'shutdown-unsupported' };
+            }
+            return { ok: true, remaining: await this.onShutdown() };
         }
         throw new Error(`Unknown op: ${(req as { op: string }).op}`);
     }
