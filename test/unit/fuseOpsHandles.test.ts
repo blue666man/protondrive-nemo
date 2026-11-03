@@ -52,3 +52,22 @@ test('writes through a handle on a file replaced by a rename stay local', { time
     await flush(m);
     assert.equal(m.fake.uploads.length, 0);
 });
+
+test('GLib-style save while another handle is open: one revision, the final content', { timeout: 5000 }, async (t) => {
+    const fake = new FakeDrive();
+    const uid = fake.addFile(fake.rootUid, 'doc.txt', 'v1');
+    const m = await mountFake(t, fake);
+    const [, h] = await m.op('open', '/doc.txt', 2);
+    const [, c] = await m.op('create', '/.doc.tmp', 0o644);
+    await write(m, '/.doc.tmp', c, 'part', 0);
+    assert.deepEqual(await m.op('rename', '/.doc.tmp', '/doc.txt'), [0]);
+    await write(m, '/doc.txt', h, 'X', 0);
+    await m.op('release', '/doc.txt', h);
+    assert.deepEqual(await flush(m), { uploaded: 0, failed: 0, retrying: 0, open: 1 });
+    assert.equal(m.fake.uploads.length, 0);
+    await write(m, '/doc.txt', c, '-rest', 4);
+    await m.op('release', '/doc.txt', c);
+    await flush(m);
+    assert.deepEqual(m.fake.uploads.map((u) => [u.kind, u.nodeUid]), [['revision', uid]]);
+    assert.equal(m.fake.contentOf(uid), 'part-rest');
+});

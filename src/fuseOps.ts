@@ -129,6 +129,14 @@ export function createFuseOperations(
         return entry;
     }
 
+    /** Points `file` at `entry`, holding a reference on it (which `release` gives back) unless it already does. */
+    function attach(file: OpenFile, entry: PendingUpload): void {
+        if (file.entry !== entry) {
+            pending.opened(entry);
+            file.entry = entry;
+        }
+    }
+
     /** After a write or truncate through `file`: make sure its content gets uploaded. */
     async function markDirty(file: OpenFile): Promise<void> {
         if (file.detached || file.entry?.cancelled) {
@@ -136,7 +144,7 @@ export function createFuseOperations(
         }
         const current = pending.get(file.path);
         if (current) {
-            file.entry = current;
+            attach(file, current);
             pending.touched(current);
             return;
         }
@@ -144,7 +152,7 @@ export function createFuseOperations(
         const node = file.entry === undefined && file.node ? file.node : await tree.resolve(file.path);
         const raced = pending.get(file.path); // a concurrent write may have started it meanwhile
         if (raced) {
-            file.entry = raced;
+            attach(file, raced);
             pending.touched(raced);
             return;
         }
