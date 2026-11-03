@@ -138,6 +138,13 @@ export class PendingUploads {
     private readonly ownRevisions = new Map<string, string>();
     private stopping = false;
 
+    /**
+     * Called when an entry's upload has finished and its content is in the
+     * content cache, with the node it landed as (undefined for a plain
+     * revision) and that node's uid.
+     */
+    onFinished?: (entry: PendingUpload, node: NodeEntity | undefined, nodeUid: string) => void;
+
     constructor(private readonly o: PendingUploadsOptions) {}
 
     get(filePath: string): PendingUpload | undefined {
@@ -584,6 +591,7 @@ export class PendingUploads {
                 this.o.logger.error(`Could not move the uploaded ${entry.path} into the content cache`, error);
             }
             this.byPath.delete(entry.path);
+            this.onFinished?.(entry, node, nodeUid);
             await this.save(entry, 'remove');
             this.notify(entry, 'uploaded');
             return;

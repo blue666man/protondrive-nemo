@@ -101,6 +101,20 @@ export function createFuseOperations(
     const openFiles = new Map<number, OpenFile>();
     let nextFd = 1000;
 
+    // Handles still open on an upload that just finished now hold that file
+    // on Drive, like handles opened on it: a further write starts a
+    // revision of it without a lookup. A revision's node is not passed, so
+    // markDirty resolves it fresh (the handle's old node names the replaced
+    // revision).
+    pending.onFinished = (entry, node) => {
+        for (const file of openFiles.values()) {
+            if (file.entry === entry) {
+                file.entry = undefined;
+                file.node = node;
+            }
+        }
+    };
+
     function register(file: OpenFile): number {
         const fd = nextFd++;
         openFiles.set(fd, file);
@@ -225,6 +239,18 @@ export function createFuseOperations(
         }
     }
 
+    function openFromDrive(path: string, cb: (err: number, fd?: number) => void): void {
+        tree
+            .resolve(path)
+            .then(async (node) => {
+                const localPath = await content.ensureDownloaded(node);
+                const { parent, name } = await tree.resolveParent(path);
+                const handle = await fsOpen(localPath, 'r+');
+                cb(0, register({ path, handle, node, parentUid: parent.uid, name, detached: false }));
+            })
+            .catch((err) => cb(errnoFor(err)));
+    }
+
     const ops: Fuse.OPERATIONS = {
         getattr(path, cb) {
             if (path === '/') {
@@ -288,19 +314,17 @@ export function createFuseOperations(
                     )
                     .catch((err) => {
                         pending.closed(entry);
+                        if ((err as NodeJS.ErrnoException).code === 'ENOENT' && pending.get(path) !== entry) {
+                            // Its upload finished in the meantime, and moved the
+                            // content into the cache: it is a file on Drive now.
+                            openFromDrive(path, cb);
+                            return;
+                        }
                         cb(errnoFor(err));
                     });
                 return;
             }
-            tree
-                .resolve(path)
-                .then(async (node) => {
-                    const localPath = await content.ensureDownloaded(node);
-                    const { parent, name } = await tree.resolveParent(path);
-                    const handle = await fsOpen(localPath, 'r+');
-                    cb(0, register({ path, handle, node, parentUid: parent.uid, name, detached: false }));
-                })
-                .catch((err) => cb(errnoFor(err)));
+            openFromDrive(path, cb);
         },
 
         create(path, _mode, cb) {

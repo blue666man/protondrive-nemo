@@ -71,3 +71,24 @@ test('GLib-style save while another handle is open: one revision, the final cont
     assert.deepEqual(m.fake.uploads.map((u) => [u.kind, u.nodeUid]), [['revision', uid]]);
     assert.equal(m.fake.contentOf(uid), 'part-rest');
 });
+
+test('a handle open while its new file is uploaded writes a revision of the uploaded node', { timeout: 5000 }, async (t) => {
+    const m = await mountFake(t);
+    await writeNew(m, '/n.txt', 'new');
+    const release = m.fake.holdUploads();
+    const flushed = flush(m);
+    const [err, fd] = await m.op('open', '/n.txt', 2);
+    assert.equal(err, 0);
+    release();
+    assert.equal((await flushed).uploaded, 1);
+    const uid = m.fake.uploads[0].nodeUid;
+    // The handle knows its node: no Drive lookup is needed (or possible) any more.
+    m.fake.iterateFolderChildrenNodeUids = () => {
+        throw new Error('no listing expected');
+    };
+    await write(m, '/n.txt', fd, 'N', 0);
+    await m.op('release', '/n.txt', fd);
+    await flush(m);
+    assert.deepEqual(m.fake.uploads.map((u) => [u.kind, u.nodeUid]), [['new', uid], ['revision', uid]]);
+    assert.equal(m.fake.contentOf(uid), 'New');
+});
