@@ -19,6 +19,11 @@ interface OpenFile {
     name: string;
     /** The pending upload this handle holds a reference on, once its content is pending. */
     entry?: PendingUpload;
+    /**
+     * Its file was deleted or replaced while open. Reads and writes still go
+     * to its fd, but like any unlinked file nothing of it reaches Drive.
+     */
+    detached: boolean;
 }
 
 /**
@@ -104,7 +109,14 @@ export function createFuseOperations(
 
     /** Open handles on `path` that still belong to a live file (not to one deleted while open). */
     function handlesOn(path: string): OpenFile[] {
-        return [...openFiles.values()].filter((file) => file.path === path && !file.entry?.cancelled);
+        return [...openFiles.values()].filter((file) => file.path === path && !file.detached && !file.entry?.cancelled);
+    }
+
+    /** The file at `path` is going away (unlinked, or replaced by a rename): its open handles keep only their fds. */
+    function detachHandles(path: string): void {
+        for (const file of handlesOn(path)) {
+            file.detached = true;
+        }
     }
 
     /** Starts a pending revision of the Drive file at `path`, shared by every handle open on it. */
@@ -119,7 +131,7 @@ export function createFuseOperations(
 
     /** After a write or truncate through `file`: make sure its content gets uploaded. */
     async function markDirty(file: OpenFile): Promise<void> {
-        if (file.entry?.cancelled) {
+        if (file.detached || file.entry?.cancelled) {
             return; // deleted while open: like any unlinked file, the writes go nowhere
         }
         const current = pending.get(file.path);
@@ -228,7 +240,7 @@ export function createFuseOperations(
                 entry.ready
                     .then(() => fsOpen(entry.localPath, 'r+'))
                     .then((handle) =>
-                        cb(0, register({ path, handle, parentUid: entry.parentUid, name: entry.name, entry })),
+                        cb(0, register({ path, handle, parentUid: entry.parentUid, name: entry.name, entry, detached: false })),
                     )
                     .catch((err) => {
                         pending.closed(entry);
@@ -242,7 +254,7 @@ export function createFuseOperations(
                     const localPath = await content.ensureDownloaded(node);
                     const { parent, name } = await tree.resolveParent(path);
                     const handle = await fsOpen(localPath, 'r+');
-                    cb(0, register({ path, handle, node, parentUid: parent.uid, name }));
+                    cb(0, register({ path, handle, node, parentUid: parent.uid, name, detached: false }));
                 })
                 .catch((err) => cb(errnoFor(err)));
         },
@@ -253,7 +265,7 @@ export function createFuseOperations(
                 .then(async ({ parent, name }) => {
                     const entry = await pending.createNew(path, parent.uid, name);
                     const handle = await fsOpen(entry.localPath, 'r+');
-                    cb(0, register({ path, handle, parentUid: parent.uid, name, entry }));
+                    cb(0, register({ path, handle, parentUid: parent.uid, name, entry, detached: false }));
                 })
                 .catch((err) => cb(errnoFor(err)));
         },
@@ -413,6 +425,7 @@ export function createFuseOperations(
                     }
                 } else {
                     await trash((await tree.resolve(path)).uid);
+                    detachHandles(path);
                 }
                 tree.invalidate(parent.uid);
             })().then(
@@ -452,6 +465,7 @@ export function createFuseOperations(
                     // rename stays local; the upload goes out under the final
                     // name.
                     let revisionOf: { nodeUid: string; baseRevisionUid?: string } | undefined;
+                    detachHandles(dest);
                     if (destEntry) {
                         if (destEntry.kind === 'revision' && destEntry.nodeUid) {
                             revisionOf = { nodeUid: destEntry.nodeUid, baseRevisionUid: destEntry.baseRevisionUid };
@@ -473,6 +487,7 @@ export function createFuseOperations(
                 }
 
                 const [node, srcCtx] = await Promise.all([tree.resolve(src), tree.resolveParent(src)]);
+                detachHandles(dest);
                 if (destEntry) {
                     await cancelPending(dest);
                 }
