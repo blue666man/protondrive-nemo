@@ -7,6 +7,15 @@ import { errno } from '../stubs/fuse-native';
 
 const flush = (m: MountedFake) => m.handle.pending.flush();
 
+/** A FakeDrive whose trashNodes() fails. */
+function failingTrash(fake: FakeDrive): FakeDrive {
+    fake.trashNodes = async function* () {
+        yield* [];
+        throw new Error('trash failed');
+    };
+    return fake;
+}
+
 test('rename of a file onto a folder fails with EISDIR, on Drive or pending', { timeout: 5000 }, async (t) => {
     const fake = new FakeDrive();
     const dir = fake.addFolder(fake.rootUid, 'dir');
@@ -60,4 +69,20 @@ test('rename of a folder onto an empty folder replaces it', { timeout: 5000 }, a
     assert.equal(m.fake.isTrashed(empty), true);
     assert.equal(m.fake.find('/empty'), src);
     assert.equal(m.fake.find('/src'), undefined);
+});
+
+test("a rename that fails keeps the destination's open handles attached", { timeout: 5000 }, async (t) => {
+    const fake = new FakeDrive();
+    fake.addFile(fake.rootUid, 'a.txt', 'from a');
+    const b = fake.addFile(fake.rootUid, 'b.txt', 'from b');
+    const m = await mountFake(t, failingTrash(fake));
+    const [, fd] = await m.op('open', '/b.txt', 2);
+    assert.deepEqual(await m.op('rename', '/a.txt', '/b.txt'), [errno('EIO')]);
+    const data = Buffer.from('X');
+    assert.deepEqual(await m.op('write', '/b.txt', fd, data, data.length, 0), [data.length]);
+    assert.equal(m.handle.pending.get('/b.txt')?.kind, 'revision', 'the write started a revision of b');
+    await m.op('release', '/b.txt', fd);
+    await flush(m);
+    assert.deepEqual(m.fake.uploads.map((u) => [u.kind, u.nodeUid]), [['revision', b]]);
+    assert.equal(m.fake.contentOf(b), 'Xrom b');
 });

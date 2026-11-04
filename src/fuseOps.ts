@@ -571,21 +571,29 @@ export function createFuseOperations(
                         await checkReplaceable(false, dest, existing);
                     }
                     let revisionOf: { nodeUid: string; baseRevisionUid?: string } | undefined;
-                    detachHandles(dest);
-                    if (destEntry) {
-                        if (destEntry.kind === 'revision' && destEntry.nodeUid) {
-                            revisionOf = { nodeUid: destEntry.nodeUid, baseRevisionUid: destEntry.baseRevisionUid };
+                    const detached = detachHandles(dest);
+                    try {
+                        if (destEntry) {
+                            if (destEntry.kind === 'revision' && destEntry.nodeUid) {
+                                revisionOf = { nodeUid: destEntry.nodeUid, baseRevisionUid: destEntry.baseRevisionUid };
+                            }
+                            await cancelPending(dest);
+                        } else if (existing) {
+                            // Replacing a file already on Drive: upload a new
+                            // revision of it, keeping its history, rather than
+                            // trashing it and starting over.
+                            revisionOf = { nodeUid: existing.uid, baseRevisionUid: existing.activeRevision?.uid };
+                            await content.forget(existing.uid);
                         }
-                        await cancelPending(dest);
-                    } else if (existing) {
-                        // Replacing a file already on Drive: upload a new
-                        // revision of it, keeping its history, rather than
-                        // trashing it and starting over.
-                        revisionOf = { nodeUid: existing.uid, baseRevisionUid: existing.activeRevision?.uid };
-                        await content.forget(existing.uid);
+                        pending.move(src, dest, destCtx.parent.uid, destCtx.name, revisionOf);
+                        retargetHandles(src, dest, destCtx.parent.uid, destCtx.name);
+                    } catch (err) {
+                        // Nothing on Drive changed: the destination's file
+                        // stays (a cancelled pending one is ignored by its
+                        // handles anyway).
+                        reattachHandles(detached);
+                        throw err;
                     }
-                    pending.move(src, dest, destCtx.parent.uid, destCtx.name, revisionOf);
-                    retargetHandles(src, dest, destCtx.parent.uid, destCtx.name);
                     return;
                 }
 
@@ -597,27 +605,40 @@ export function createFuseOperations(
                 if (destEntry || existingDest) {
                     await checkReplaceable(node.type === NodeType.Folder, dest, existingDest);
                 }
-                detachHandles(dest);
-                if (destEntry) {
-                    await cancelPending(dest);
+                const detached = detachHandles(dest);
+                let destTrashed = false;
+                try {
+                    if (destEntry) {
+                        await cancelPending(dest);
+                    }
+                    if (existingDest) {
+                        await trash(existingDest.uid, () => {
+                            destTrashed = true;
+                        });
+                    }
+                    if (srcCtx.parent.uid !== destCtx.parent.uid) {
+                        await drain(sdk.moveNodes([node.uid], destCtx.parent.uid));
+                    }
+                    if (srcCtx.name !== destCtx.name) {
+                        await sdk.renameNode(node.uid, destCtx.name);
+                    }
+                    tree.invalidate(srcCtx.parent.uid, destCtx.parent.uid);
+                    if (srcEntry) {
+                        pending.move(src, dest, destCtx.parent.uid, destCtx.name); // the revision follows its node
+                    }
+                    if (node.type === NodeType.Folder) {
+                        pending.moveFolder(src, dest);
+                    }
+                    retargetHandles(src, dest, destCtx.parent.uid, destCtx.name);
+                } catch (err) {
+                    // The destination's file stays, unless Drive trashed it
+                    // already (a cancelled pending one is ignored by its
+                    // handles anyway).
+                    if (!destTrashed) {
+                        reattachHandles(detached);
+                    }
+                    throw err;
                 }
-                if (existingDest) {
-                    await trash(existingDest.uid);
-                }
-                if (srcCtx.parent.uid !== destCtx.parent.uid) {
-                    await drain(sdk.moveNodes([node.uid], destCtx.parent.uid));
-                }
-                if (srcCtx.name !== destCtx.name) {
-                    await sdk.renameNode(node.uid, destCtx.name);
-                }
-                tree.invalidate(srcCtx.parent.uid, destCtx.parent.uid);
-                if (srcEntry) {
-                    pending.move(src, dest, destCtx.parent.uid, destCtx.name); // the revision follows its node
-                }
-                if (node.type === NodeType.Folder) {
-                    pending.moveFolder(src, dest);
-                }
-                retargetHandles(src, dest, destCtx.parent.uid, destCtx.name);
             })().then(
                 () => cb(0),
                 (err) => cb(errnoFor(err)),
