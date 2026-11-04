@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { FakeDrive } from '../fakeDrive';
 import { type MountedFake, mountFake, writeNew } from '../mountFake';
 import { errno } from '../stubs/fuse-native';
+import { sleep } from '../support';
 
 const flush = (m: MountedFake) => m.handle.pending.flush();
 
@@ -91,4 +92,25 @@ test('a handle open while its new file is uploaded writes a revision of the uplo
     await flush(m);
     assert.deepEqual(m.fake.uploads.map((u) => [u.kind, u.nodeUid]), [['new', uid], ['revision', uid]]);
     assert.equal(m.fake.contentOf(uid), 'New');
+});
+
+test('a write while an unlink is trashing the file on Drive starts no revision', { timeout: 5000 }, async (t) => {
+    const fake = new FakeDrive();
+    fake.addFile(fake.rootUid, 'log.txt', 'old');
+    const trashNodes = fake.trashNodes.bind(fake);
+    fake.trashNodes = async function* (uids) {
+        await sleep(50);
+        yield* trashNodes(uids);
+    };
+    const m = await mountFake(t, fake);
+    const [, fd] = await m.op('open', '/log.txt', 2);
+    const unlinked = m.op('unlink', '/log.txt');
+    await sleep(10);
+    await write(m, '/log.txt', fd, 'more', 3);
+    assert.deepEqual(await unlinked, [0]);
+    assert.equal(m.handle.pending.has('/log.txt'), false, 'no pending entry');
+    assert.deepEqual(await m.op('readdir', '/'), [0, []]);
+    await m.op('release', '/log.txt', fd);
+    await flush(m);
+    assert.equal(m.fake.uploads.length, 0);
 });

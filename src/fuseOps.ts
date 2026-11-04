@@ -126,10 +126,23 @@ export function createFuseOperations(
         return [...openFiles.values()].filter((file) => file.path === path && !file.detached && !file.entry?.cancelled);
     }
 
-    /** The file at `path` is going away (unlinked, or replaced by a rename): its open handles keep only their fds. */
-    function detachHandles(path: string): void {
-        for (const file of handlesOn(path)) {
+    /**
+     * The file at `path` is going away (unlinked, or replaced by a rename):
+     * its open handles keep only their fds. Returns them, for
+     * `reattachHandles` should the operation fail.
+     */
+    function detachHandles(path: string): OpenFile[] {
+        const files = handlesOn(path);
+        for (const file of files) {
             file.detached = true;
+        }
+        return files;
+    }
+
+    /** Undoes `detachHandles` after the operation failed and the file stayed. */
+    function reattachHandles(files: OpenFile[]): void {
+        for (const file of files) {
+            file.detached = false;
         }
     }
 
@@ -216,8 +229,10 @@ export function createFuseOperations(
         }
     }
 
-    async function trash(uid: string): Promise<void> {
+    /** Trashes `uid` on Drive and forgets it; `onTrashed` runs as soon as Drive has trashed it. */
+    async function trash(uid: string, onTrashed?: () => void): Promise<void> {
         await drain(sdk.trashNodes([uid]));
+        onTrashed?.();
         tree.forgetNode(uid);
         await content.forget(uid);
     }
@@ -484,18 +499,38 @@ export function createFuseOperations(
 
         unlink(path, cb) {
             (async () => {
-                const { parent } = await tree.resolveParent(path);
                 const entry = pending.get(path);
                 if (entry) {
+                    const { parent } = await tree.resolveParent(path);
                     await cancelPending(path);
                     if (entry.kind === 'revision' && entry.nodeUid) {
                         await trash(entry.nodeUid);
                     }
-                } else {
-                    await trash((await tree.resolve(path)).uid);
-                    detachHandles(path);
+                    tree.invalidate(parent.uid);
+                    return;
                 }
-                tree.invalidate(parent.uid);
+                // On Drive only. Detach before the first await: a write in
+                // the meantime would start a revision of the file going away.
+                const detached = detachHandles(path);
+                let trashed = false;
+                let parentUid: string;
+                try {
+                    const { parent } = await tree.resolveParent(path);
+                    parentUid = parent.uid;
+                    await trash((await tree.resolve(path)).uid, () => {
+                        trashed = true;
+                    });
+                } catch (err) {
+                    if (!trashed) {
+                        reattachHandles(detached);
+                    }
+                    throw err;
+                }
+                // Belt and braces: a write already past its detached check.
+                if (pending.get(path)) {
+                    await cancelPending(path);
+                }
+                tree.invalidate(parentUid);
             })().then(
                 () => cb(0),
                 (err) => cb(errnoFor(err)),
