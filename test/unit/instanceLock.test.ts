@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { test, type TestContext } from 'node:test';
 
@@ -10,6 +10,19 @@ import Fuse from '../stubs/fuse-native';
 
 /** A pid that cannot belong to a live process: above Linux's default pid_max (2^22). */
 const DEAD_PID = 2 ** 22 + 12345;
+
+/** Field 22 (starttime) of /proc/<pid>/stat, or undefined where /proc is not readable. */
+function startTimeOf(pid: number): string | undefined {
+    try {
+        const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+        return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
+    } catch {
+        return undefined;
+    }
+}
+
+/** What our own lock file holds. */
+const OUR_LOCK = `${process.pid} ${startTimeOf(process.pid) ?? '-'}`;
 
 /** Shuts a mount down as SIGTERM would, and releases its lock. */
 async function shutdown(handle: MountHandle): Promise<void> {
@@ -84,16 +97,72 @@ test('a lock left by a process that is gone is taken over', { timeout: 5000 }, a
     mkdirSync(p.cacheDir, { recursive: true });
     writeFileSync(p.lockFile, `${DEAD_PID}\n`);
     await p.mount();
-    assert.equal(readFileSync(p.lockFile, 'utf8').trim(), String(process.pid));
+    assert.equal(readFileSync(p.lockFile, 'utf8').trim(), OUR_LOCK);
 });
 
 test('after the first mount shuts down and releases its lock, a new mount succeeds', { timeout: 5000 }, async (t) => {
     const p = profile(t);
     const first = await p.mount();
-    assert.equal(readFileSync(p.lockFile, 'utf8').trim(), String(process.pid), 'the lock holds our pid');
+    assert.equal(readFileSync(p.lockFile, 'utf8'), `${OUR_LOCK}\n`, 'the lock holds our pid and start time');
     p.forget(first);
     await shutdown(first);
     assert.equal(existsSync(p.lockFile), false, 'release removed the lock');
     await p.mount();
     assert.equal(existsSync(p.lockFile), true);
+});
+
+test('a lock with our own pid that this process does not hold is taken over', { timeout: 5000 }, async (t) => {
+    const p = profile(t);
+    mkdirSync(p.cacheDir, { recursive: true });
+    writeFileSync(p.lockFile, `${OUR_LOCK}\n`); // an earlier life of this pid, e.g. before a restart
+    await p.mount();
+    assert.equal(readFileSync(p.lockFile, 'utf8'), `${OUR_LOCK}\n`);
+});
+
+test('a lock whose pid is alive but started at another time (pid reuse) is taken over', { timeout: 5000 }, async (t) => {
+    const start = startTimeOf(1);
+    if (start === undefined) {
+        t.skip('/proc/1/stat is not readable');
+        return;
+    }
+    const p = profile(t);
+    mkdirSync(p.cacheDir, { recursive: true });
+    writeFileSync(p.lockFile, `1 ${Number(start) + 1}\n`);
+    await p.mount();
+    assert.equal(readFileSync(p.lockFile, 'utf8'), `${OUR_LOCK}\n`);
+});
+
+test('a lock whose pid is alive with the start time it recorded is refused', { timeout: 5000 }, async (t) => {
+    const start = startTimeOf(1);
+    if (start === undefined) {
+        t.skip('/proc/1/stat is not readable');
+        return;
+    }
+    const p = profile(t);
+    mkdirSync(p.cacheDir, { recursive: true });
+    writeFileSync(p.lockFile, `1 ${start}\n`);
+    await assert.rejects(p.mount(), /already running for this account \(pid 1\)/);
+    assert.equal(readFileSync(p.lockFile, 'utf8'), `1 ${start}\n`, 'the lock is left alone');
+});
+
+test('an empty lock is refused while it is fresh (being written), taken over once old', { timeout: 5000 }, async (t) => {
+    const p = profile(t);
+    mkdirSync(p.cacheDir, { recursive: true });
+    writeFileSync(p.lockFile, '');
+    await assert.rejects(p.mount(), /already running for this account/);
+    assert.equal(readFileSync(p.lockFile, 'utf8'), '', 'the lock is left alone');
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(p.lockFile, old, old);
+    await p.mount();
+    assert.equal(readFileSync(p.lockFile, 'utf8'), `${OUR_LOCK}\n`);
+});
+
+test('the lock is written whole, through a temp file that does not stay behind', { timeout: 5000 }, async (t) => {
+    const p = profile(t);
+    await p.mount();
+    assert.equal(readFileSync(p.lockFile, 'utf8'), `${OUR_LOCK}\n`);
+    assert.deepEqual(
+        readdirSync(p.cacheDir).filter((name) => name.startsWith('daemon.lock')),
+        ['daemon.lock'],
+    );
 });
