@@ -109,12 +109,21 @@ program
         // The handlers go in before mount(): a signal while it runs would
         // otherwise kill the process with the mount up and the lock held.
         // Such a signal is remembered, and the shutdown runs once the mount
-        // is up. (Not unit-tested: this file runs commander at import.)
+        // is up. A second one before then quits at once, for a mount that
+        // hangs. That is safe: the lock left behind names this process,
+        // which is gone, so the next start takes it over; and the next
+        // mount's fuse-native mount (force: true) clears a half-up mount
+        // left on the mount point. (Not unit-tested: this file runs
+        // commander at import.)
         let shutdown: ((reason: string) => ShutdownRun) | undefined;
         let earlySignal: string | undefined;
         const onSignal = (signal: string) => {
             if (!shutdown) {
-                earlySignal ??= signal;
+                if (earlySignal) {
+                    process.exit(1);
+                }
+                earlySignal = signal;
+                console.log('Will shut down once mounted (press Ctrl-C again to quit now)');
                 return;
             }
             void shutdown(signal).done.then((code) => process.exit(code));
