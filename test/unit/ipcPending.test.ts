@@ -76,3 +76,32 @@ test('the shutdown reply still arrives when the shutdown stops the control socke
     assert.equal(await done, 0);
     await assert.rejects(sendRequest(socketPathFor(m.cacheDir), { op: 'pendingStatus' }), /mount-not-running/);
 });
+
+test('a failed shutdown still answers, even as the shutdown stops the control socket', { timeout: 5000 }, async (t) => {
+    const m = await mountFake(t);
+    const shutdown = guardedShutdown({
+        drain: async () => {
+            throw new Error('drain broke');
+        },
+        steps: [['stop the control socket', () => m.handle.ipc.stop()]],
+        log: () => {},
+        error: () => {},
+    });
+    let done: Promise<number> | undefined;
+    m.handle.ipc.onShutdown = () => {
+        const run = shutdown('unmount requested');
+        done = run.done;
+        return run.drained;
+    };
+    assert.deepEqual(await sendRequest(socketPathFor(m.cacheDir), { op: 'shutdown' }), { ok: false, error: 'drain broke' });
+    assert.equal(await done, 1);
+});
+
+test('a shutdown hook that rejects still gets its answer to the client', { timeout: 5000 }, async (t) => {
+    const m = await mountFake(t);
+    m.handle.ipc.onShutdown = async () => {
+        void m.handle.ipc.stop();
+        throw new Error('drain broke');
+    };
+    assert.deepEqual(await sendRequest(socketPathFor(m.cacheDir), { op: 'shutdown' }), { ok: false, error: 'drain broke' });
+});

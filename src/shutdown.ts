@@ -64,3 +64,24 @@ export function guardedShutdown(o: ShutdownOptions): (reason: string) => Shutdow
         return run;
     };
 }
+
+/**
+ * fusermount's answers when there is nothing to unmount (any more): the
+ * mount is gone already, which is what unmounting wants. fusermount 2 and
+ * 3 say "entry for … not found in /etc/mtab"; "Invalid argument" is the
+ * kernel's EINVAL for a mount point that is no longer mounted.
+ */
+const NOT_MOUNTED = /not mounted|not found in \/etc\/mtab|Invalid argument/;
+
+/** Wraps `unmount` for a shutdown step: a mount that is gone already counts as unmounted. */
+export function unmountStep(unmount: () => Promise<void>): () => Promise<void> {
+    return async () => {
+        try {
+            await unmount();
+        } catch (err) {
+            if (!(err instanceof Error && NOT_MOUNTED.test(err.message))) {
+                throw err;
+            }
+        }
+    };
+}

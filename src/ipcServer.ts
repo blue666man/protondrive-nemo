@@ -175,6 +175,12 @@ export class IpcServer {
         Promise.resolve()
             .then(() => {
                 req = JSON.parse(line) as IpcRequest;
+                if (req.op === 'shutdown') {
+                    // The shutdown stops the server, perhaps before it
+                    // answers: keep this client out of stop()'s reach, so
+                    // its answer (ok or not) always arrives.
+                    this.sockets.delete(socket);
+                }
                 return this.handleRequest(req);
             })
             .catch((err): Response => ({
@@ -182,10 +188,7 @@ export class IpcServer {
                 error: err instanceof NodeNotFoundError ? 'not-found' : err instanceof Error ? err.message : String(err),
             }))
             .then((res) => {
-                if (req?.op === 'shutdown' && res.ok) {
-                    // The daemon stops the server next: answer and close
-                    // gracefully, out of stop()'s reach.
-                    this.sockets.delete(socket);
+                if (req?.op === 'shutdown') {
                     socket.end(`${JSON.stringify(res)}\n`);
                     return;
                 }

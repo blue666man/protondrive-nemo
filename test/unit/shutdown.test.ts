@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { guardedShutdown } from '../../src/shutdown';
+import { guardedShutdown, unmountStep } from '../../src/shutdown';
 
 /** A guardedShutdown whose drain and steps record their order in `calls`; `fail` names the ones that throw. */
 function recorded(fail: string[] = [], remaining = 2) {
@@ -72,4 +72,53 @@ test('the steps wait until whoever awaits drained has run (an IPC reply goes out
     await run.done;
     await replied;
     assert.deepEqual(r.calls, ['drain', 'reply', 'ipc', 'fuse', 'lock', 'dispose']);
+});
+
+/** fusermount's failure for `message`, as fuse-native's unmount passes it on (exec's error). */
+function fusermountError(message: string): Error {
+    return new Error(`Command failed: fusermount -uz "/home/u/ProtonDrive"\nfusermount: ${message}\n`);
+}
+
+for (const [what, message] of [
+    ['not mounted', '/home/u/ProtonDrive: not mounted'],
+    ['not found in /etc/mtab', 'entry for /home/u/ProtonDrive not found in /etc/mtab'],
+    ['Invalid argument', 'failed to unmount /home/u/ProtonDrive: Invalid argument'],
+]) {
+    test(`the unmount step takes "${what}" for success: the mount is gone already`, { timeout: 5000 }, async () => {
+        let calls = 0;
+        const shutdown = guardedShutdown({
+            drain: async () => 0,
+            steps: [
+                [
+                    'unmount',
+                    unmountStep(async () => {
+                        calls++;
+                        throw fusermountError(message);
+                    }),
+                ],
+            ],
+            log: () => {},
+        });
+        assert.equal(await shutdown('SIGTERM').done, 0);
+        assert.equal(calls, 1);
+    });
+}
+
+test('the unmount step still fails on any other fusermount error', { timeout: 5000 }, async () => {
+    const errors: string[] = [];
+    const shutdown = guardedShutdown({
+        drain: async () => 0,
+        steps: [
+            [
+                'unmount',
+                unmountStep(async () => {
+                    throw fusermountError('failed to unmount /home/u/ProtonDrive: Device or resource busy');
+                }),
+            ],
+        ],
+        log: () => {},
+        error: (message) => errors.push(message),
+    });
+    assert.equal(await shutdown('SIGTERM').done, 1);
+    assert.equal(errors.length, 1);
 });

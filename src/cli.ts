@@ -10,7 +10,7 @@ import type { FlushResult, PendingStatus } from './pendingUploads';
 import { getConfig } from './sdk-bootstrap/config';
 import { initDrive } from './sdk-bootstrap/init';
 import { mount, unmount } from './mount';
-import { guardedShutdown } from './shutdown';
+import { guardedShutdown, type ShutdownRun, unmountStep } from './shutdown';
 
 const APP_VERSION = 'external-drive-protondrive_nemo@0.1.0-alpha';
 const DISCLOSURE = 'protondrive-nemo is a third-party application, not officially supported by Proton.';
@@ -105,31 +105,56 @@ program
     .action(async (opts: { account?: string; mountPoint?: string }) => {
         const mountPoint = opts.mountPoint ?? defaultMountPointFor(opts.account);
         const d = await drive(opts.account);
-        const { fuse, ipc, pending, shutdownGraceMs, releaseLock } = await mount(d, mountPoint);
-        console.log(`Mounted Proton Drive at ${mountPoint}`);
 
-        // Bounded: running uploads get the grace period, the rest wait in
-        // the journal for the next mount.
-        const shutdown = guardedShutdown({
-            drain: () => pending.shutdown(shutdownGraceMs),
-            steps: [
-                ['stop the control socket', () => ipc.stop()],
-                ['unmount', () => new Promise<void>((resolve, reject) => fuse.unmount((err) => (err ? reject(err) : resolve())))],
-                ['release the instance lock', releaseLock],
-                ['close the session', () => d.dispose()],
-            ],
-        });
+        // The handlers go in before mount(): a signal while it runs would
+        // otherwise kill the process with the mount up and the lock held.
+        // Such a signal is remembered, and the shutdown runs once the mount
+        // is up. (Not unit-tested: this file runs commander at import.)
+        let shutdown: ((reason: string) => ShutdownRun) | undefined;
+        let earlySignal: string | undefined;
         const onSignal = (signal: string) => {
+            if (!shutdown) {
+                earlySignal ??= signal;
+                return;
+            }
             void shutdown(signal).done.then((code) => process.exit(code));
         };
         process.on('SIGINT', onSignal);
         process.on('SIGTERM', onSignal);
+
+        let handle: Awaited<ReturnType<typeof mount>>;
+        try {
+            handle = await mount(d, mountPoint);
+        } catch (err) {
+            console.error(err instanceof Error ? err.message : err);
+            process.exit(1);
+        }
+        const { fuse, ipc, pending, shutdownGraceMs, releaseLock } = handle;
+        console.log(`Mounted Proton Drive at ${mountPoint}`);
+
+        // Bounded: running uploads get the grace period, the rest wait in
+        // the journal for the next mount.
+        shutdown = guardedShutdown({
+            drain: () => pending.shutdown(shutdownGraceMs),
+            steps: [
+                ['stop the control socket', () => ipc.stop()],
+                [
+                    'unmount',
+                    unmountStep(() => new Promise<void>((resolve, reject) => fuse.unmount((err) => (err ? reject(err) : resolve())))),
+                ],
+                ['release the instance lock', releaseLock],
+                ['close the session', () => d.dispose()],
+            ],
+        });
         // `protondrive-nemo unmount`: answered once the uploads are journalled.
         ipc.onShutdown = () => {
             const run = shutdown('unmount requested');
             void run.done.then((code) => process.exit(code));
             return run.drained;
         };
+        if (earlySignal) {
+            onSignal(earlySignal);
+        }
     });
 
 program
@@ -148,6 +173,13 @@ program
         if (res.error === 'mount-not-running') {
             // No daemon (crashed, or killed): just detach a mount left behind.
             await unmount(mountPoint);
+            console.log(`Unmounted ${mountPoint}`);
+            process.exit(0);
+        }
+        if (res.error === 'no-answer') {
+            // The daemon went away without answering (it crashed, or was
+            // killed, mid-shutdown): detach the mount if it got no further.
+            await unmountStep(() => unmount(mountPoint))();
             console.log(`Unmounted ${mountPoint}`);
             process.exit(0);
         }
