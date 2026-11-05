@@ -62,7 +62,10 @@ export interface Config {
     /**
      * Absolute path to the GPG-encrypted credentials file. Only ciphertext is
      * written here; plaintext credentials never touch disk. Defaults to
-     * `<appDir>/auth-session.gpg` (override with `PROTONDRIVE_NEMO_CREDENTIALS_FILE`).
+     * `<appDir>/auth-session.gpg`. `PROTONDRIVE_NEMO_CREDENTIALS_FILE`
+     * overrides it for the default profile only; every other `--account`
+     * always uses its own `<appDir>/auth-session.gpg`, so profiles never
+     * share (and overwrite) one session file.
      */
     credentialsFile: string;
 
@@ -97,8 +100,11 @@ export function getConfig(options: InitConfig): Config {
     const baseUrl = process.env.PROTONDRIVE_NEMO_BASE_URL || 'drive-api.proton.me';
 
     const gpgRecipient = process.env.PROTONDRIVE_NEMO_GPG_RECIPIENT || undefined;
-    const credentialsFile =
-        process.env.PROTONDRIVE_NEMO_CREDENTIALS_FILE || path.join(appDir, 'auth-session.gpg');
+    // The override names one file, so it can only belong to one profile: the
+    // default. Other profiles keep their own, or `--account work login`
+    // would overwrite the default account's session.
+    const credentialsOverride = profile === 'default' ? process.env.PROTONDRIVE_NEMO_CREDENTIALS_FILE : undefined;
+    const credentialsFile = credentialsOverride || path.join(appDir, 'auth-session.gpg');
 
     const cachePaths = options.cachePaths ?? parsePathList(process.env.PROTONDRIVE_NEMO_CACHE_PATHS);
     const ephemeralCache = options.ephemeralCache ?? isTruthy(process.env.PROTONDRIVE_NEMO_EPHEMERAL_CACHE);

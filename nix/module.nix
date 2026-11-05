@@ -103,7 +103,11 @@ in
       type = lib.types.nullOr lib.types.str;
       default = null;
       example = "/home/user/.local/share/protondrive-nemo/auth-session.gpg";
-      description = "Path to the GPG-encrypted session file (`PROTONDRIVE_NEMO_CREDENTIALS_FILE`).";
+      description = ''
+        Path to the GPG-encrypted session file of the default account
+        (`PROTONDRIVE_NEMO_CREDENTIALS_FILE`). Other `--account` profiles
+        ignore it and keep `auth-session.gpg` in their own data directory.
+      '';
     };
 
     dataDir = lib.mkOption {

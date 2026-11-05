@@ -42,10 +42,12 @@ a real FUSE filesystem, so file-manager integration comes for free.
   - `PROTONDRIVE_NEMO_GPG_RECIPIENT` is **required**: there is no OS
     keychain and no passphrase fallback, and `login`/`mount` refuse to start
     without it.
-  - `PROTONDRIVE_NEMO_CREDENTIALS_FILE` overrides where the encrypted
-    session is kept; the default is `auth-session.gpg` in the account's app
-    data dir (`$XDG_DATA_HOME/protondrive-nemo[-<name>]/`), so each
-    `--account` gets its own file — see [Multiple accounts](#multiple-accounts).
+  - The encrypted session is `auth-session.gpg` in the account's app data
+    dir (`$XDG_DATA_HOME/protondrive-nemo[-<name>]/`), so each `--account`
+    gets its own file — see [Multiple accounts](#multiple-accounts).
+    `PROTONDRIVE_NEMO_CREDENTIALS_FILE` moves the **default** account's
+    file only; any other `--account` ignores it and keeps its own, so a
+    `login --account work` can never overwrite the default session.
 
 ## Requirements
 
