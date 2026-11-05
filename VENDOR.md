@@ -35,7 +35,7 @@ application to provide: an HTTP client wired to the account session, an
 encrypted-at-rest SQLite entities/crypto cache, and an event-cursor
 persistence layer so the SDK can use event-based sync instead of polling.
 
-Changes from upstream, all mechanical (no logic changes):
+Changes from upstream (mechanical, except the credentials store below):
 
 - `cache/sqliteCache.ts`: `bun:sqlite``Database` → `better-sqlite3`.
 - `clientUid.ts`: `Bun.file`/`Bun.write` → `node:fs/promises`.
@@ -43,7 +43,18 @@ Changes from upstream, all mechanical (no logic changes):
   `keytar` here) was replaced by the GnuPG store
   `credentials/gpgCredentialsStore.ts` from
   [NioZow/protondrive-fuse](https://github.com/NioZow/protondrive-fuse)
-  (commit `ccc0c22`), copied verbatim apart from env var names in comments.
+  (commit `ccc0c22`). Env vars are renamed `PROTONDRIVE_GPG_*` →
+  `PROTONDRIVE_NEMO_GPG_*` in comments and in the error string of
+  `credentials/index.ts`. Deliberate deviations from the audited code in
+  `gpgCredentialsStore.ts`:
+  - encryption passes `--auto-key-locate clear,local --no-auto-key-retrieve`,
+    so the session is only ever encrypted to a key already in the local
+    keyring. gpg's default lookup includes WKD: with a mistyped or
+    not-yet-imported recipient it would fetch a key over the network and,
+    under `--trust-model always`, encrypt the account-wide session to it.
+    `clear` is needed because mechanisms set in `gpg.conf` otherwise still
+    apply. Decryption passes `--no-auto-key-retrieve` too, so no key is
+    fetched there either.
   The session is encrypted to `PROTONDRIVE_NEMO_GPG_RECIPIENT` and kept in
   `PROTONDRIVE_NEMO_CREDENTIALS_FILE` (default `<appDir>/auth-session.gpg`);
   decryption goes through `gpg-agent`. There is no keychain fallback, and
@@ -64,4 +75,4 @@ Changes from upstream, all mechanical (no logic changes):
 
 This module is not a general-purpose library; it's this project's own
 adapted copy of Proton's reference wiring, kept in its own directory so the
-provenance and the two changes above stay easy to audit against upstream.
+provenance and the changes listed above stay easy to audit against upstream.

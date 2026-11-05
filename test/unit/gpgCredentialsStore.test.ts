@@ -108,6 +108,34 @@ test('remove() deletes the file and is idempotent', async () => {
     await store.remove();
 });
 
+test('save() to a recipient with no local key rejects without fetching one (no WKD)', async () => {
+    // `.invalid` never resolves, so even the pre-fix WKD lookup reached no third party.
+    const file = credentialsFile();
+    const store = new GpgCredentialsStore(file, 'nobody@example.invalid', silentLogger);
+    await assert.rejects(store.save(snapshot), (error: unknown) => {
+        assert.ok(error instanceof Error, String(error));
+        assert.ok(!/WKD/i.test(error.message), error.message);
+        return true;
+    });
+    assert.ok(!existsSync(file));
+});
+
+test('a gpg.conf that enables WKD cannot re-enable the network lookup', async () => {
+    // `--auto-key-locate` mechanisms accumulate after gpg.conf's unless cleared.
+    const conf = path.join(home, 'gpg.conf');
+    writeFileSync(conf, 'auto-key-locate local,wkd\nauto-key-retrieve\n');
+    try {
+        const store = new GpgCredentialsStore(credentialsFile(), 'nobody@example.invalid', silentLogger);
+        await assert.rejects(store.save(snapshot), (error: unknown) => {
+            assert.ok(error instanceof Error, String(error));
+            assert.ok(!/WKD/i.test(error.message), error.message);
+            return true;
+        });
+    } finally {
+        rmSync(conf, { force: true });
+    }
+});
+
 const ENV = ['PROTONDRIVE_NEMO_GPG_RECIPIENT', 'PROTONDRIVE_NEMO_CREDENTIALS_FILE'] as const;
 
 function withEnv(values: Partial<Record<(typeof ENV)[number], string>>, fn: () => void): void {

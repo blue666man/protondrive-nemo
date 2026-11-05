@@ -34,7 +34,13 @@ export class GpgCredentialsStore implements CredentialsStore {
 
         let plaintext: string;
         try {
-            plaintext = (await runGpg(['--batch', '--quiet', '--no-tty', '--decrypt'], encrypted)).toString('utf8');
+            // No key fetch while decrypting either (a signed message would
+            // otherwise look up its signer if gpg.conf asks for that).
+            const decrypted = await runGpg(
+                ['--batch', '--quiet', '--no-tty', '--no-auto-key-retrieve', '--decrypt'],
+                encrypted,
+            );
+            plaintext = decrypted.toString('utf8');
         } catch (error: unknown) {
             throw new ValidationError(
                 `Failed to decrypt ${this.credentialsFile} with GPG (is the secret key for ${this.recipient} available to gpg-agent?)`,
@@ -58,6 +64,15 @@ export class GpgCredentialsStore implements CredentialsStore {
                 '--no-tty',
                 '--trust-model',
                 'always',
+                // Only a key already in the local keyring may be used: gpg's
+                // default lookup includes WKD, which for a mistyped or
+                // not-yet-imported recipient would fetch some key from the
+                // network and encrypt the account-wide session to it,
+                // unchecked under `--trust-model always`. `clear` first,
+                // because mechanisms from gpg.conf otherwise still apply.
+                '--auto-key-locate',
+                'clear,local',
+                '--no-auto-key-retrieve',
                 '--armor',
                 '--encrypt',
                 '--recipient',
