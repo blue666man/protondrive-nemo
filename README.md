@@ -214,7 +214,10 @@ account profile: its own credentials file, its own cache/app dir
 `$XDG_DATA_HOME/protondrive-nemo-<name>`), and its own default mount point
 (`~/ProtonDrive-<name>`). Omitting `--account` (or passing `--account
 default`) is exactly today's single-account behavior — nothing changes for
-an existing install.
+an existing install. The names `tmp`, `blobs` and `pending` (any case) are
+reserved: with `PROTONDRIVE_NEMO_DATA_DIR` set, other accounts live in
+`<dir>/<name>`, beside the default account's cache directories of those
+names.
 
 ```bash
 node dist/cli.js login --account work

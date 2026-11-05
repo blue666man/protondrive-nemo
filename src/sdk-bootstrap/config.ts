@@ -155,6 +155,18 @@ function accountUrlFromBaseUrl(baseUrl: string): string {
 }
 
 /**
+ * With `PROTONDRIVE_NEMO_DATA_DIR` set, the default profile uses that
+ * directory itself and every other profile `<dir>/<name>`, so a profile may
+ * not be named after a subdirectory the default profile creates there
+ * (content cache, temp copies, pending uploads): it would be wiped with it.
+ * Every other fixed name in that directory (`daemon.lock`, `daemon.sock`,
+ * `events.json`, `clientUid.json`, `cache-*.sqlite`, `auth-session.gpg`)
+ * contains a dot, which a profile name cannot. Lower-case, matched
+ * case-insensitively.
+ */
+const RESERVED_PROFILE_NAMES = new Set(['tmp', 'blobs', 'pending']);
+
+/**
  * `profile` gets interpolated straight into filesystem paths below, so this
  * isn't cosmetic — an unvalidated value (e.g. containing `..` or `/`) would be
  * a path-traversal bug.
@@ -162,6 +174,11 @@ function accountUrlFromBaseUrl(baseUrl: string): string {
 function validateProfileName(profile: string): void {
     if (!/^[A-Za-z0-9_-]+$/.test(profile)) {
         throw new Error(`Invalid profile name "${profile}": use only letters, digits, "-", "_".`);
+    }
+    if (RESERVED_PROFILE_NAMES.has(profile.toLowerCase())) {
+        throw new Error(
+            `Invalid profile name "${profile}": "${profile}" is reserved (with PROTONDRIVE_NEMO_DATA_DIR set, its directory would be the default account's ${profile.toLowerCase()}/ cache directory).`,
+        );
     }
 }
 
