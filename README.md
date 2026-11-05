@@ -268,6 +268,8 @@ Two environment variables for `mount` narrow that down:
   throwaway copy, and the whole content cache is wiped when the mount starts
   and when it stops.
 
+Changes waiting to upload are kept in `pending/` whatever the policy says; once uploaded, a file outside the allowlist is not kept.
+
 ```bash
 PROTONDRIVE_NEMO_CACHE_PATHS="/Documents,/Photos" node dist/cli.js mount
 PROTONDRIVE_NEMO_EPHEMERAL_CACHE=1 node dist/cli.js mount

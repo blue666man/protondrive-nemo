@@ -74,8 +74,8 @@ test('our own revision that landed despite a cancel is not taken for a remote ed
     t.after(s.cleanup);
     const uid = s.fake.addFile(s.fake.rootUid, 'r.txt', 'v1');
     const node = await s.fake.client.getNode(uid);
-    await s.content.ensureDownloaded(node);
-    const edit = s.pending.beginRevision('/r.txt', node, s.fake.rootUid, 'r.txt', 1);
+    const cached = await s.content.ensureDownloaded(node);
+    const edit = s.pending.beginRevision('/r.txt', node, s.fake.rootUid, 'r.txt', 1, cached);
     await edit.ready;
     await writeFile(edit.localPath, 'v2');
     s.pending.closed(edit);

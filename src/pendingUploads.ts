@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { createReadStream, mkdirSync, renameSync } from 'node:fs';
+import { createReadStream, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { chmod, rename, stat, utimes, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -13,6 +13,7 @@ import {
 } from '@protontech/drive-sdk';
 import type { Logger, NodeEntity, ProtonDriveClient } from '@protontech/drive-sdk';
 
+import type { CachePolicy } from './cachePolicy';
 import { conflictName } from './conflictName';
 import type { ContentStore, UploadOptions } from './contentStore';
 import type { DriveTree } from './driveTree';
@@ -103,6 +104,8 @@ export interface PendingUploadsOptions {
     retryMaxMs?: number;
     /** Clock for conflict-copy names. */
     now?: () => Date;
+    /** Which paths may keep their content in the cache once uploaded; default: every path. */
+    policy?: CachePolicy;
 }
 
 /** How long shutdown and cancel wait for aborted uploads to wind down. */
@@ -139,11 +142,13 @@ export class PendingUploads {
     private stopping = false;
 
     /**
-     * Called when an entry's upload has finished and its content is in the
-     * content cache, with the node it landed as (undefined for a plain
-     * revision) and that node's uid.
+     * Called when an entry's upload has finished, with the node it landed as
+     * (undefined for a plain revision) and that node's uid. Its content is
+     * now in the content cache: in tmp/ when `ephemeral` (a path the cache
+     * policy does not keep, still open somewhere), else in blobs/ (or gone,
+     * for such a path no one has open).
      */
-    onFinished?: (entry: PendingUpload, node: NodeEntity | undefined, nodeUid: string) => void;
+    onFinished?: (entry: PendingUpload, node: NodeEntity | undefined, nodeUid: string, ephemeral: boolean) => void;
 
     constructor(private readonly o: PendingUploadsOptions) {}
 
@@ -172,12 +177,20 @@ export class PendingUploads {
     }
 
     /**
-     * The Drive file `node` at `filePath` is about to change. Its cached copy
-     * (the file open handles write to) moves out of the content cache into
-     * the pending dir, where evict and clear-cache can't delete it.
+     * The Drive file `node` at `filePath` is about to change. Its local copy
+     * `sourcePath` (the file open handles write to, in blobs/ or tmp/) moves
+     * out of the content cache into the pending dir, where evict,
+     * clear-cache and the ephemeral wipe can't delete it.
      * Registered synchronously, so concurrent writers find one entry.
      */
-    beginRevision(filePath: string, node: NodeEntity, parentUid: string, name: string, refCount: number): PendingUpload {
+    beginRevision(
+        filePath: string,
+        node: NodeEntity,
+        parentUid: string,
+        name: string,
+        refCount: number,
+        sourcePath: string,
+    ): PendingUpload {
         const entry = this.register({
             kind: 'revision',
             path: filePath,
@@ -189,7 +202,7 @@ export class PendingUploads {
             state: 'open',
         });
         // The cache's copy was created under the umask; pending content is ours alone.
-        entry.ready = rename(this.o.content.localPathFor(node.uid), entry.localPath).then(() =>
+        entry.ready = rename(sourcePath, entry.localPath).then(() =>
             chmod(entry.localPath, 0o600),
         );
         entry.ready.catch((error) => this.o.logger.error(`Could not move ${name} into the pending dir`, error));
@@ -586,15 +599,27 @@ export class PendingUploads {
             // Keep the uploaded content as the cached copy, as upload-on-close did. Synchronous, and
             // in the same turn as dropping the entry: in between, a read would find neither the
             // entry nor the cached copy and download the file again.
-            const cached = this.o.content.localPathFor(nodeUid);
+            // Only a cacheable path keeps the uploaded content; anything else
+            // (outside the allowlist, or ephemeral mode) is not kept on disk,
+            // except in tmp/ while a handle still has it open (reopened during
+            // the upload): a write through it starts the next revision from
+            // there, and its last close drops it. Not once shutting down: the
+            // ephemeral wipe may have run already.
+            const cacheable = this.o.policy?.isCacheable(entry.path) ?? true;
+            const throwaway = !cacheable && entry.refCount > 0 && !this.stopping;
             try {
-                mkdirSync(path.dirname(cached), { recursive: true, mode: 0o700 });
-                renameSync(entry.localPath, cached);
+                if (cacheable || throwaway) {
+                    const cached = this.o.content.localPathFor(nodeUid, throwaway);
+                    mkdirSync(path.dirname(cached), { recursive: true, mode: 0o700 });
+                    renameSync(entry.localPath, cached);
+                } else {
+                    rmSync(entry.localPath, { force: true });
+                }
             } catch (error) {
                 this.o.logger.error(`Could not move the uploaded ${entry.path} into the content cache`, error);
             }
             this.byPath.delete(entry.path);
-            this.onFinished?.(entry, node, nodeUid);
+            this.onFinished?.(entry, node, nodeUid, throwaway);
             await this.save(entry, 'remove');
             this.notify(entry, 'uploaded');
             return;

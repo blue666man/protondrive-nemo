@@ -69,6 +69,7 @@ export async function mount(
         journal: new PendingJournal(path.join(drive.config.cacheDir, 'pending')),
         logger: drive.logger,
         settleMs,
+        policy,
     });
     // Before the journal is loaded: a second daemon would take the first
     // one's open files for leftovers and delete them.

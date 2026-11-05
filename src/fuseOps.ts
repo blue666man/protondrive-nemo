@@ -20,6 +20,8 @@ interface OpenFile {
     name: string;
     /** The pending upload this handle holds a reference on, once its content is pending. */
     entry?: PendingUpload;
+    /** Its copy is in tmp/ (the path is not cacheable); dropped when the last handle on it closes. */
+    ephemeral: boolean;
     /**
      * Its file was deleted or replaced while open. Reads and writes still go
      * to its fd, but like any unlinked file nothing of it reaches Drive.
@@ -107,12 +109,14 @@ export function createFuseOperations(
     // on Drive, like handles opened on it: a further write starts a
     // revision of it without a lookup. A revision's node is not passed, so
     // markDirty resolves it fresh (the handle's old node names the replaced
-    // revision).
-    pending.onFinished = (entry, node) => {
+    // revision). Outside the cache policy, PendingUploads left their content
+    // in tmp/, which the last of them drops on close.
+    pending.onFinished = (entry, node, _nodeUid, ephemeral) => {
         for (const file of openFiles.values()) {
             if (file.entry === entry) {
                 file.entry = undefined;
                 file.node = node;
+                file.ephemeral = ephemeral;
             }
         }
     };
@@ -148,10 +152,14 @@ export function createFuseOperations(
         }
     }
 
-    /** Starts a pending revision of the Drive file at `path`, shared by every handle open on it. */
-    function startRevision(path: string, node: NodeEntity, parentUid: string, name: string): PendingUpload {
+    /**
+     * Starts a pending revision of the Drive file at `path`, shared by every
+     * handle open on it. `sourcePath` is its local copy (in blobs/ or tmp/),
+     * which moves into the pending dir.
+     */
+    function startRevision(path: string, node: NodeEntity, parentUid: string, name: string, sourcePath: string): PendingUpload {
         const handles = handlesOn(path);
-        const entry = pending.beginRevision(path, node, parentUid, name, handles.length);
+        const entry = pending.beginRevision(path, node, parentUid, name, handles.length, sourcePath);
         for (const handle of handles) {
             handle.entry = entry;
         }
@@ -185,7 +193,7 @@ export function createFuseOperations(
             pending.touched(raced);
             return;
         }
-        startRevision(file.path, node, file.parentUid, file.name);
+        startRevision(file.path, node, file.parentUid, file.name, content.localPathFor(node.uid, file.ephemeral));
     }
 
     /** Resolves if `path` exists, as a pending file or on Drive. */
@@ -260,10 +268,11 @@ export function createFuseOperations(
         tree
             .resolve(path)
             .then(async (node) => {
-                const localPath = await content.ensureDownloaded(node);
+                const ephemeral = !policy.isCacheable(path);
+                const localPath = await content.ensureDownloaded(node, { ephemeral });
                 const { parent, name } = await tree.resolveParent(path);
                 const handle = await fsOpen(localPath, 'r+');
-                cb(0, register({ path, handle, node, parentUid: parent.uid, name, detached: false }));
+                cb(0, register({ path, handle, node, parentUid: parent.uid, name, ephemeral, detached: false }));
             })
             .catch((err) => cb(errnoFor(err)));
     }
@@ -310,8 +319,8 @@ export function createFuseOperations(
                 .catch((err) => cb(errnoFor(err)));
         },
 
-        // The local cache copy is disposable: content is uploaded on release,
-        // so there is nothing meaningful to sync to persistent storage.
+        // Content lives in pending/ and is uploaded after the settle window
+        // (see `protondrive-nemo flush`); kernel flush/fsync are no-ops.
         flush(_path, _fd, cb) {
             cb(0);
         },
@@ -376,7 +385,18 @@ export function createFuseOperations(
                 entry.ready
                     .then(() => fsOpen(entry.localPath, 'r+'))
                     .then((handle) =>
-                        cb(0, register({ path, handle, parentUid: entry.parentUid, name: entry.name, entry, detached: false })),
+                        cb(
+                            0,
+                            register({
+                                path,
+                                handle,
+                                parentUid: entry.parentUid,
+                                name: entry.name,
+                                entry,
+                                ephemeral: false, // the content is in pending/
+                                detached: false,
+                            }),
+                        ),
                     )
                     .catch((err) => {
                         pending.closed(entry);
@@ -399,7 +419,7 @@ export function createFuseOperations(
                 .then(async ({ parent, name }) => {
                     const entry = await pending.createNew(path, parent.uid, name);
                     const handle = await fsOpen(entry.localPath, 'r+');
-                    cb(0, register({ path, handle, parentUid: parent.uid, name, entry, detached: false }));
+                    cb(0, register({ path, handle, parentUid: parent.uid, name, entry, ephemeral: false, detached: false }));
                 })
                 .catch((err) => cb(errnoFor(err)));
         },
@@ -455,9 +475,10 @@ export function createFuseOperations(
                 let entry = pending.get(path);
                 if (!entry) {
                     const node = await tree.resolve(path);
-                    await content.ensureDownloaded(node);
+                    const ephemeral = !policy.isCacheable(path);
+                    const localPath = await content.ensureDownloaded(node, { ephemeral });
                     const { parent, name } = await tree.resolveParent(path);
-                    entry = pending.get(path) ?? startRevision(path, node, parent.uid, name);
+                    entry = pending.get(path) ?? startRevision(path, node, parent.uid, name, localPath);
                 }
                 await entry.ready;
                 await fsTruncate(entry.localPath, size);
@@ -468,6 +489,9 @@ export function createFuseOperations(
             );
         },
 
+        // A tmp/ copy (a path the cache policy does not keep) goes with the
+        // last handle on it. Known limitation: a file renamed across the
+        // allowlist while open keeps the copy it was opened with.
         release(_path, fd, cb) {
             const file = openFiles.get(fd);
             if (!file) {
@@ -478,13 +502,25 @@ export function createFuseOperations(
             file.handle
                 .close()
                 .catch(() => {})
-                .then(() => {
+                .then(async () => {
                     // The kernel returned from close() before sending this, so the
                     // upload never happens here: it waits for the settle window
                     // (pendingUploads.ts), where a following utimens or rename
                     // still counts.
                     if (file.entry && pending.get(file.path) === file.entry) {
                         pending.closed(file.entry);
+                    }
+                    // Once a revision started, the copy is in pending/: nothing to drop here.
+                    const node = file.node;
+                    if (file.ephemeral && !file.entry && node) {
+                        const shared = [...openFiles.values()].some(
+                            (other) => other.ephemeral && !other.entry && other.node?.uid === node.uid,
+                        );
+                        if (!shared) {
+                            await content
+                                .forgetEphemeral(node.uid)
+                                .catch((err) => logger.warn(`Could not remove the throwaway copy of ${file.path}: ${err}`));
+                        }
                     }
                     cb(0);
                 });

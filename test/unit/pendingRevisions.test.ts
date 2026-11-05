@@ -13,7 +13,7 @@ async function editedFile(s: PendingSetup, name: string, text: string, mine: str
     const uid = s.fake.addFile(s.fake.rootUid, name, text);
     const node = await s.fake.client.getNode(uid);
     const cached = await s.content.ensureDownloaded(node);
-    const entry = s.pending.beginRevision(`/${name}`, node, s.fake.rootUid, name, 1);
+    const entry = s.pending.beginRevision(`/${name}`, node, s.fake.rootUid, name, 1, cached);
     await entry.ready;
     assert.equal(existsSync(cached), false, 'the cached copy moved into the pending dir');
     await writeFile(entry.localPath, mine);
@@ -166,8 +166,8 @@ test('a revision blob is private even under umask 022', { timeout: 5000 }, async
     t.after(s.cleanup);
     const uid = s.fake.addFile(s.fake.rootUid, 'r.txt', 'old');
     const node = await s.fake.client.getNode(uid);
-    await s.content.ensureDownloaded(node);
-    const entry = s.pending.beginRevision('/r.txt', node, s.fake.rootUid, 'r.txt', 1);
+    const cached = await s.content.ensureDownloaded(node);
+    const entry = s.pending.beginRevision('/r.txt', node, s.fake.rootUid, 'r.txt', 1, cached);
     await entry.ready;
     assert.equal(statSync(entry.localPath).mode & 0o777, 0o600);
 });

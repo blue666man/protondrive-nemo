@@ -129,6 +129,11 @@ export class ContentStore {
         ]);
     }
 
+    /** Deletes the throwaway copy of `nodeUid`, if any (the persistent cache is not touched). */
+    async forgetEphemeral(nodeUid: string): Promise<void> {
+        await rm(this.localPathFor(nodeUid, true), { force: true });
+    }
+
     /** Deletes every cached blob (persistent and throwaway). Used by the ephemeral-cache mode. */
     async wipe(): Promise<void> {
         this.logger.debug(`Wiping content cache under ${this.persistentDir} and ${this.ephemeralDir}`);

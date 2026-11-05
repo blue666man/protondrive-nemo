@@ -35,7 +35,7 @@ test('access succeeds on root and existing paths, ENOENT otherwise', async (t) =
     assert.deepEqual(await callOp(o.access, '/missing', 0), [errno('ENOENT')]);
 });
 
-test('flush, fsync and fsyncdir succeed (content is uploaded on release)', async (t) => {
+test('flush, fsync and fsyncdir succeed (content is uploaded from pending/ after the settle window)', async (t) => {
     const o = await ops(t);
     assert.deepEqual(await callOp(o.flush, '/a.txt', 1000), [0]);
     assert.deepEqual(await callOp(o.fsync, '/a.txt', false, 1000), [0]);

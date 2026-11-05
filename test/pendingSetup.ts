@@ -1,8 +1,12 @@
 import { utimes, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
+import type Fuse from '@cocalc/fuse-native';
+
+import { createCachePolicy } from '../src/cachePolicy';
 import { ContentStore } from '../src/contentStore';
 import { DriveTree } from '../src/driveTree';
+import { createFuseOperations } from '../src/fuseOps';
 import { PendingJournal } from '../src/pendingJournal';
 import { type PendingUpload, PendingUploads, type PendingUploadsOptions } from '../src/pendingUploads';
 import { FakeDrive } from './fakeDrive';
@@ -17,6 +21,8 @@ export interface PendingSetup {
     tree: DriveTree;
     content: ContentStore;
     pending: PendingUploads;
+    /** FUSE handlers over `pending`, with the same cache policy. */
+    ops: Fuse.OPERATIONS;
     /** Temp dir holding blobs/ (content cache) and pending/ (journal). */
     dir: string;
     /** A new PendingUploads on the same dirs, resumed, as the next mount would create it. */
@@ -24,10 +30,15 @@ export interface PendingSetup {
     cleanup(): void;
 }
 
-/** A PendingUploads over a FakeDrive; settle window 60 s (tests flush), retries after 10-40 ms. */
+/**
+ * A PendingUploads over a FakeDrive; settle window 60 s (tests flush),
+ * retries after 10-40 ms. The cache policy (`overrides.policy`) defaults to
+ * caching everything.
+ */
 export async function setupPending(overrides: Partial<PendingUploadsOptions> = {}): Promise<PendingSetup> {
     const tmp = tempDir();
     const fake = new FakeDrive();
+    const policy = overrides.policy ?? createCachePolicy({ cachePaths: [], ephemeralCache: false });
     const make = async (extra: Partial<PendingUploadsOptions>) => {
         const tree = new DriveTree(fake.client, silentLogger);
         const content = new ContentStore(fake.client, tmp.dir, silentLogger);
@@ -41,6 +52,7 @@ export async function setupPending(overrides: Partial<PendingUploadsOptions> = {
             retryBaseMs: 10,
             retryMaxMs: 40,
             now: () => CONFLICT_CLOCK,
+            policy,
             ...overrides,
             ...extra,
         });
@@ -48,9 +60,11 @@ export async function setupPending(overrides: Partial<PendingUploadsOptions> = {
         return { tree, content, pending };
     };
     const first = await make({});
+    const { ops } = createFuseOperations(fake.client, first.tree, first.content, policy, first.pending, silentLogger);
     return {
         fake,
         ...first,
+        ops,
         dir: tmp.dir,
         restart: async (extra = {}) => (await make(extra)).pending,
         cleanup: tmp.cleanup,
