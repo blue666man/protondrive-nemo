@@ -96,6 +96,56 @@ change `l->atime` to `l->mtime` in the second `FUSE_UINT64_TO_INTS_ARGV` of
 the `utimens` method, delete its `build/` directory, then run
 `npm rebuild @cocalc/fuse-native`.
 
+## Nix
+
+The repository is a flake (`nixpkgs` is its only input):
+
+```bash
+nix build              # or: nix build .#protondrive-nemo
+```
+
+This builds `result/bin/protondrive-nemo`, wrapped with `gpg` on its `PATH`.
+The build:
+
+- applies the [fuse-native#3](https://github.com/sagemathinc/fuse-native/issues/3)
+  fix to `@cocalc/fuse-native` (≤ 2.4.3 passes the atime where the mtime
+  belongs in `utimens`, so every `touch`/`rsync -t`/`cp -p` would set the
+  wrong time). A guard fails the build if the patch no longer finds its
+  target line, so a reshaped upstream file can't silently ship the bug; once
+  a fixed release is in the lockfile the patch is a no-op;
+- runs no dependency's lifecycle scripts (`npm rebuild --ignore-scripts`),
+  then builds only the two native addons, `@cocalc/fuse-native` and
+  `better-sqlite3`, from source against Nix's `fuse` and `sqlite`;
+  `prebuild-install` never downloads a prebuilt binary;
+- runs `npm run typecheck` and `npm test` (the tier-1 tests above); the
+  mount tests need `/dev/fuse` and are not run in the sandbox.
+
+For home-manager, import the flake's module and enable it; the options become
+`PROTONDRIVE_NEMO_*` defaults baked into a wrapper (an explicit value in your
+shell still wins):
+
+```nix
+{
+  imports = [ protondrive-nemo.homeManagerModules.default ];
+  programs.protondrive-nemo = {
+    enable = true;
+    gpgRecipient = "0x…";
+  };
+}
+```
+
+Further options: `cachePaths`, `ephemeralCache`, `credentialsFile`,
+`dataDir`, `baseUrl`, `logLevel`, `allowRoot` (needs
+`programs.fuse.userAllowOther = true` in NixOS) and `environment`. No
+service is installed; you start the mount yourself (`protondrive-nemo
+mount`), after `gpg-agent` can decrypt.
+
+`nix develop` gives a shell with Node 22, the build toolchain, `fuse`,
+`sqlite` and `gnupg`.
+
+The flake, package, module and dev shell are adapted from
+[NioZow/protondrive-fuse](https://github.com/NioZow/protondrive-fuse).
+
 ## Usage
 
 ```bash

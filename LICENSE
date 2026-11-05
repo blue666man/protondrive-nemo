@@ -27,7 +27,7 @@ This project vendors and adapts code from ProtonDriveApps/sdk
 also MIT licensed. See VENDOR.md and vendor/proton-drive-sdk-account/LICENSE.md.
 
 Ported code: src/cachePolicy.ts, src/sdk-bootstrap/credentials/gpgCredentialsStore.ts,
-and the cache-mode and FUSE-handler code in src/contentStore.ts and
-src/fuseOps.ts, come from NioZow/protondrive-fuse
-(https://github.com/NioZow/protondrive-fuse), a fork of this project,
+the cache-mode and FUSE-handler code in src/contentStore.ts and
+src/fuseOps.ts, and the Nix packaging in flake.nix and nix/, come from
+NioZow/protondrive-fuse (https://github.com/NioZow/protondrive-fuse), a fork of this project,
 Copyright (c) 2026 proton-drive contributors, also MIT licensed.
