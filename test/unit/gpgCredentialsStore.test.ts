@@ -51,11 +51,14 @@ before(() => {
 });
 
 after(() => {
-    execFileSync('gpgconf', ['--kill', 'all'], { stdio: 'ignore' });
-    if (savedHome === undefined) delete process.env.GNUPGHOME;
-    else process.env.GNUPGHOME = savedHome;
-    rmSync(home, { recursive: true, force: true });
-    rmSync(files, { recursive: true, force: true });
+    try {
+        execFileSync('gpgconf', ['--kill', 'all'], { stdio: 'ignore' });
+    } finally {
+        if (savedHome === undefined) delete process.env.GNUPGHOME;
+        else process.env.GNUPGHOME = savedHome;
+        rmSync(home, { recursive: true, force: true });
+        rmSync(files, { recursive: true, force: true });
+    }
 });
 
 test('save() then load() round-trips the snapshot', async () => {
