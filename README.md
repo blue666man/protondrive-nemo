@@ -209,14 +209,15 @@ command. libfuse accepts this only when `/etc/fuse.conf` contains the line
 PROTONDRIVE_NEMO_FUSE_ALLOW_ROOT=1 node dist/cli.js mount
 ```
 
-### Run automatically on login
+### Starting the mount
 
-```bash
-mkdir -p ~/.config/systemd/user
-ln -s "$(pwd)/systemd/protondrive-nemo.service" ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now protondrive-nemo
-```
+On this branch the mount is started by hand (`protondrive-nemo mount`, or
+`node dist/cli.js mount`), after `gpg-agent` can use your key: the stored
+session is GPG-encrypted, and a service started at login would run before the
+agent is unlocked (and without `PROTONDRIVE_NEMO_GPG_RECIPIENT`). The units in
+`systemd/` are kept for the upstream keytar setup and are not supported here:
+they set no recipient and run `dist/cli.js` through nvm, so they would
+restart in a loop.
 
 ### Add a Nemo sidebar shortcut
 
@@ -243,15 +244,9 @@ node dist/cli.js login --account work
 node dist/cli.js mount --account work     # mounts ~/ProtonDrive-work
 ```
 
-To run a second account as an always-on background service alongside the
-default one, use the templated unit — it doesn't touch the existing
-`protondrive-nemo.service`:
-
-```bash
-ln -s "$(pwd)/systemd/protondrive-nemo@.service" ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now protondrive-nemo@work
-```
+Each account's mount is started by hand too (see
+[Starting the mount](#starting-the-mount)); the templated unit
+`systemd/protondrive-nemo@.service` is not supported on this branch.
 
 Add its own sidebar bookmark the same way, just pointed at its mount point:
 
