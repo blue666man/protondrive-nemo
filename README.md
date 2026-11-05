@@ -61,16 +61,40 @@ a real FUSE filesystem, so file-manager integration comes for free.
 
 ## Build
 
+On this branch dependencies are installed without running any lifecycle
+script, and only the two native addons, `@cocalc/fuse-native` and
+`better-sqlite3`, are built. No other dependency needs its script: core-js
+only prints a banner, exifreader builds a custom bundle only when configured
+to, and esbuild's checks the platform binary `npm ci` installs anyway (and
+could download one). The FUSE binding is
+patched first, for
+[fuse-native#3](https://github.com/sagemathinc/fuse-native/issues/3):
+`@cocalc/fuse-native` ≤ 2.4.3 passes the atime where the mtime belongs in
+`utimens`, so every `touch`/`rsync -t`/`cp -p` would set the wrong time. This
+is the same patch `nix/package.nix` applies.
+
 ```bash
-npm install
+npm ci --ignore-scripts
+sed -i '/FUSE_METHOD_VOID(utimens/,/^})/ s/FUSE_UINT64_TO_INTS_ARGV(l->atime, 5)/FUSE_UINT64_TO_INTS_ARGV(l->mtime, 5)/' \
+  node_modules/@cocalc/fuse-native/fuse-native.c
+sed -n '/FUSE_METHOD_VOID(utimens/,/^})/p' node_modules/@cocalc/fuse-native/fuse-native.c   # check: l->mtime, 5
+rm -rf node_modules/@cocalc/fuse-native/build
+npm rebuild @cocalc/fuse-native better-sqlite3 --build-from-source
 npm run build
 ```
 
-This produces `dist/cli.js`. `npm install` needs `libfuse-dev` present to
-compile the native FUSE binding:
+This produces `dist/cli.js`. The rebuild needs a C toolchain, Python and the
+FUSE headers (`libfuse-dev`) found through `pkg-config`:
 
 ```bash
 sudo apt install libfuse-dev   # Debian/Ubuntu/Linux Mint
+```
+
+`nix develop` (see [Nix](#nix)) provides all of this. When building on NixOS
+outside that shell, point `pkg-config` at `fuse.dev` first:
+
+```bash
+export PKG_CONFIG_PATH="$(nix build --no-link --print-out-paths nixpkgs#fuse.dev)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 ```
 
 ## Tests
@@ -85,7 +109,6 @@ an in-memory stand-in (`test/stubs/fuse-native.ts`), so the tests need
 neither `/dev/fuse` nor any native module to be built.
 
 ```bash
-npm rebuild @cocalc/fuse-native   # once: builds the native FUSE binding
 npm run test:mount
 ```
 
@@ -93,12 +116,8 @@ Mounts the filesystem for real, backed by an in-memory Drive
 (`test/fakeDrive.ts`), and drives it with `rsync`, `cp`, `touch` and `mv`. It
 checks that every file is uploaded once, under its final name, with its own
 modification time. It needs `/dev/fuse`, a setuid `fusermount`, and the native
-binding built with the fix for
-[fuse-native#3](https://github.com/sagemathinc/fuse-native/issues/3). Until a
-fixed release exists: in `node_modules/@cocalc/fuse-native/fuse-native.c`,
-change `l->atime` to `l->mtime` in the second `FUSE_UINT64_TO_INTS_ARGV` of
-the `utimens` method, delete its `build/` directory, then run
-`npm rebuild @cocalc/fuse-native`.
+binding built with the fuse-native#3 patch as shown under [Build](#build); an
+unpatched binding fails its modification-time checks.
 
 ## Nix
 

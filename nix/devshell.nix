@@ -33,8 +33,9 @@ pkgs.mkShell {
 
     echo "protondrive-nemo dev shell"
     echo "  node: $(node --version)  npm: $(npm --version)"
-    echo "  deps:  npm ci --ignore-scripts"
-    echo "         npm rebuild @cocalc/fuse-native better-sqlite3 --build-from-source"
+    echo "  deps:  see README.md, Build: npm ci --ignore-scripts, then the"
+    echo "         fuse-native utimens sed patch, then the native rebuild"
+    echo "         (an unpatched binding fails tier 2)"
     echo "  build: npm run build"
     echo "  test:  npm test   (tier 2: npm run test:mount)"
   '';
