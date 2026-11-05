@@ -55,9 +55,12 @@ Changes from upstream (mechanical, except the credentials store below):
     `clear` is needed because mechanisms set in `gpg.conf` otherwise still
     apply. Decryption passes `--no-auto-key-retrieve` too, so no key is
     fetched there either.
-  - the file is written atomically (0600 temp file, fsync, rename, directory
-    fsync) instead of `writeFile` in place: the session is re-saved on every
-    token refresh, and a torn file would force a re-login.
+  - the file is written atomically (a uniquely named 0600 temp file,
+    `<file>.<pid>.<uuid>.tmp`, then fsync, rename, directory fsync) instead
+    of `writeFile` in place: the session is re-saved on every token refresh,
+    and a torn file would force a re-login. The unique name keeps two
+    concurrent saves of one profile from unlinking or renaming each other's
+    half-written temp file.
   - a missing `gpg` binary is reported as "gpg not found on PATH (install
     GnuPG)" instead of a bare `spawn gpg ENOENT` or a decrypt error.
   The session is encrypted to `PROTONDRIVE_NEMO_GPG_RECIPIENT` and kept in

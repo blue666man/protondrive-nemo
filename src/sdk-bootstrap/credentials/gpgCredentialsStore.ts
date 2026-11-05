@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -88,16 +89,18 @@ export class GpgCredentialsStore implements CredentialsStore {
 
     /**
      * The session is re-saved on every token refresh, so a crash or a full
-     * disk mid-write must not leave a torn file: write a fresh 0600 temp file,
-     * fsync it, rename it over the old one and fsync the directory. The old
-     * file or the new one survives, never a truncated one.
+     * disk mid-write must not leave a torn file: write a fresh, uniquely
+     * named 0600 temp file, fsync it, rename it over the old one and fsync
+     * the directory. The old file or the new one survives, never a truncated
+     * one.
      */
     private async writeAtomically(data: Buffer): Promise<void> {
         const dir = path.dirname(this.credentialsFile);
-        const tmp = `${this.credentialsFile}.tmp`;
+        // A temp name of its own per write: two saves of one profile racing
+        // (e.g. two token refreshes) must not share, unlink or rename each
+        // other's half-written file.
+        const tmp = `${this.credentialsFile}.${process.pid}.${randomUUID()}.tmp`;
         await mkdir(dir, { recursive: true });
-        // A leftover temp file would keep its old mode through open('w').
-        await rm(tmp, { force: true });
         try {
             const handle = await open(tmp, 'wx', 0o600);
             try {

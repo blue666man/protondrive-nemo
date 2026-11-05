@@ -109,6 +109,40 @@ test('a failed save() leaves the previous file intact and no temp file behind', 
     assert.deepEqual(readFileSync(file), before);
 });
 
+test('two concurrent save() calls leave exactly one of the two snapshots intact', async () => {
+    const a: Credentials = { ...snapshot, userKeyPassword: 'user-key-pw-concurrent-a' };
+    const b: Credentials = { ...snapshot, userKeyPassword: 'user-key-pw-concurrent-b' };
+    for (let round = 0; round < 5; round += 1) {
+        const file = credentialsFile();
+        const store = new GpgCredentialsStore(file, RECIPIENT, silentLogger);
+        const results = await Promise.allSettled([store.save(a), store.save(b)]);
+        assert.ok(results.some((r) => r.status === 'fulfilled'), JSON.stringify(results));
+        const loaded = await store.load();
+        assert.ok(
+            [a.userKeyPassword, b.userKeyPassword].includes(loaded?.userKeyPassword ?? ''),
+            String(loaded?.userKeyPassword),
+        );
+        assert.deepEqual(loaded, loaded?.userKeyPassword === a.userKeyPassword ? a : b);
+        assert.deepEqual(readdirSync(path.dirname(file)), ['auth-session.gpg']);
+    }
+});
+
+test('concurrent writes of the file never tear it (the write step, raced directly)', async () => {
+    // gpg's run time spreads real save() calls apart; racing the write step
+    // itself forces the interleaving a shared temp name cannot survive.
+    const file = credentialsFile();
+    const store = new GpgCredentialsStore(file, RECIPIENT, silentLogger);
+    const write = (data: Buffer): Promise<void> =>
+        (store as unknown as { writeAtomically(data: Buffer): Promise<void> }).writeAtomically(data);
+    const a = Buffer.alloc(4 << 20, 'a');
+    const b = Buffer.alloc(4 << 20, 'b');
+    const results = await Promise.allSettled([write(a), write(b)]);
+    assert.ok(results.some((r) => r.status === 'fulfilled'), JSON.stringify(results));
+    const onDisk = readFileSync(file);
+    assert.ok(onDisk.equals(a) || onDisk.equals(b), `torn file: ${onDisk.length} bytes`);
+    assert.deepEqual(readdirSync(path.dirname(file)), ['auth-session.gpg']);
+});
+
 test('without gpg on PATH, save() and load() say so', async () => {
     const file = credentialsFile();
     const store = new GpgCredentialsStore(file, RECIPIENT, silentLogger);
