@@ -66,11 +66,13 @@ buildNpmPackage {
     # (sagemathinc/fuse-native#3). A no-op once fixed upstream; a reshaped
     # file fails the build here instead of silently shipping the bug.
     # The guard looks only inside the utimens method, so an unrelated
-    # `l->mtime, 5` elsewhere in the file cannot satisfy it.
+    # `l->mtime, 5` elsewhere in the file cannot satisfy it, and it also
+    # fails if an `l->atime, 5` is still left there.
     sed -i '/FUSE_METHOD_VOID(utimens/,/^})/ s/FUSE_UINT64_TO_INTS_ARGV(l->atime, 5)/FUSE_UINT64_TO_INTS_ARGV(l->mtime, 5)/' \
       node_modules/@cocalc/fuse-native/fuse-native.c
-    sed -n '/FUSE_METHOD_VOID(utimens/,/^})/p' node_modules/@cocalc/fuse-native/fuse-native.c \
-      | grep -q 'FUSE_UINT64_TO_INTS_ARGV(l->mtime, 5)' \
+    utimens="$(sed -n '/FUSE_METHOD_VOID(utimens/,/^})/p' node_modules/@cocalc/fuse-native/fuse-native.c)"
+    { printf '%s\n' "$utimens" | grep -q 'FUSE_UINT64_TO_INTS_ARGV(l->mtime, 5)' \
+      && ! printf '%s\n' "$utimens" | grep -q 'FUSE_UINT64_TO_INTS_ARGV(l->atime, 5)'; } \
       || { echo "fuse-native utimens patch did not apply" >&2; exit 1; }
     echo "fuse-native utimens patch applied"
     npm rebuild @cocalc/fuse-native better-sqlite3 --build-from-source --foreground-scripts
