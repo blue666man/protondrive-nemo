@@ -4,6 +4,8 @@ An unofficial FUSE mount of [Proton Drive](https://proton.me/drive) for
 Linux Mint's Nemo file manager (and any other file manager, since it's a
 real mountpoint — Nautilus, Thunar, Dolphin, etc. all work too).
 
+> This is the `encephalon` deployment branch: see [ENCEPHALON.md](ENCEPHALON.md).
+
 > **This is a third-party application, not officially supported by Proton.**
 > It is not affiliated with, endorsed by, or connected to Proton AG. It is
 > built on Proton's official, MIT-licensed [Drive SDK](https://github.com/ProtonDriveApps/sdk),
