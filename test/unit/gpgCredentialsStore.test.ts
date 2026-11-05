@@ -106,6 +106,27 @@ test('a failed save() leaves the previous file intact and no temp file behind', 
     assert.deepEqual(readFileSync(file), before);
 });
 
+test('without gpg on PATH, save() and load() say so', async () => {
+    const file = credentialsFile();
+    const store = new GpgCredentialsStore(file, RECIPIENT, silentLogger);
+    await store.save(snapshot);
+    const emptyBin = mkdtempSync(path.join(tmpdir(), 'pdg-nobin-'));
+    const savedPath = process.env.PATH;
+    const notFound = (error: unknown) => {
+        assert.ok(error instanceof Error, String(error));
+        assert.match(error.message, /gpg not found on PATH \(install GnuPG\)/);
+        return true;
+    };
+    try {
+        process.env.PATH = emptyBin;
+        await assert.rejects(store.save(snapshot), notFound);
+        await assert.rejects(store.load(), notFound);
+    } finally {
+        process.env.PATH = savedPath;
+        rmSync(emptyBin, { recursive: true, force: true });
+    }
+});
+
 test('load() returns null when there is no file', async () => {
     const store = new GpgCredentialsStore(credentialsFile(), RECIPIENT, silentLogger);
     assert.equal(await store.load(), null);

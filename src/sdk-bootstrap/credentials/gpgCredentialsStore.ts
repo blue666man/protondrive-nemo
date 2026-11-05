@@ -42,6 +42,8 @@ export class GpgCredentialsStore implements CredentialsStore {
             );
             plaintext = decrypted.toString('utf8');
         } catch (error: unknown) {
+            // gpg missing altogether: say that, not "is the secret key available".
+            if (error instanceof ValidationError) throw error;
             throw new ValidationError(
                 `Failed to decrypt ${this.credentialsFile} with GPG (is the secret key for ${this.recipient} available to gpg-agent?)`,
                 undefined,
@@ -123,7 +125,11 @@ export class GpgCredentialsStore implements CredentialsStore {
     }
 }
 
-/** Runs `gpg` with `args`, feeding `input` on stdin; resolves with stdout or rejects on a non-zero exit. */
+/**
+ * Runs `gpg` with `args`, feeding `input` on stdin; resolves with stdout or
+ * rejects on a non-zero exit. A missing `gpg` binary rejects with a
+ * ValidationError saying so; every other failure is a plain Error.
+ */
 function runGpg(args: string[], input: Buffer): Promise<Buffer> {
     return new Promise((resolve, reject) => {
         const child = spawn('gpg', args, { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -131,7 +137,13 @@ function runGpg(args: string[], input: Buffer): Promise<Buffer> {
         const stderr: Buffer[] = [];
         child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
         child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
-        child.on('error', reject);
+        child.on('error', (error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT') {
+                reject(new ValidationError('gpg not found on PATH (install GnuPG)', undefined, { cause: error }));
+                return;
+            }
+            reject(error);
+        });
         child.on('close', (code) => {
             if (code === 0) {
                 resolve(Buffer.concat(stdout));
