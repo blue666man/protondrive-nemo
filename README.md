@@ -63,11 +63,12 @@ a real FUSE filesystem, so file-manager integration comes for free.
 
 On this branch dependencies are installed without running any lifecycle
 script, and only the two native addons, `@cocalc/fuse-native` and
-`better-sqlite3`, are built. No other dependency needs its script: core-js
-only prints a banner, exifreader builds a custom bundle only when configured
-to, and esbuild's checks the platform binary `npm ci` installs anyway (and
-could download one). The FUSE binding is
-patched first, for
+`better-sqlite3`, are built. No other dependency needs its install script:
+core-js's only prints a banner, exifreader's builds a custom bundle only when
+a project configures one, and esbuild's only verifies the platform binary
+that `npm ci` already installs (and may download one if it is missing).
+
+Before that rebuild, the FUSE binding is patched for
 [fuse-native#3](https://github.com/sagemathinc/fuse-native/issues/3):
 `@cocalc/fuse-native` ≤ 2.4.3 passes the atime where the mtime belongs in
 `utimens`, so every `touch`/`rsync -t`/`cp -p` would set the wrong time. This
