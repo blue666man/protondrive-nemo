@@ -603,20 +603,26 @@ export class PendingUploads {
             // (outside the allowlist, or ephemeral mode) is not kept on disk,
             // except in tmp/ while a handle still has it open (reopened during
             // the upload): a write through it starts the next revision from
-            // there, and its last close drops it. Not once shutting down: the
-            // ephemeral wipe may have run already.
+            // there, and its last close drops it (cleanup() also clears tmp/
+            // after unmounting). Not while shutting down in ephemeral mode: the
+            // full wipe may have run already. Known gap: a write through such a
+            // handle in that window, before the unmount, is lost.
             const cacheable = this.o.policy?.isCacheable(entry.path) ?? true;
-            const throwaway = !cacheable && entry.refCount > 0 && !this.stopping;
-            try {
-                if (cacheable || throwaway) {
-                    const cached = this.o.content.localPathFor(nodeUid, throwaway);
+            const throwaway = !cacheable && entry.refCount > 0 && !(this.stopping && this.o.policy?.ephemeral);
+            if (cacheable || throwaway) {
+                const cached = this.o.content.localPathFor(nodeUid, throwaway);
+                try {
                     mkdirSync(path.dirname(cached), { recursive: true, mode: 0o700 });
                     renameSync(entry.localPath, cached);
-                } else {
-                    rmSync(entry.localPath, { force: true });
+                } catch (error) {
+                    this.o.logger.error(`Could not move the uploaded ${entry.path} into the content cache`, error);
                 }
-            } catch (error) {
-                this.o.logger.error(`Could not move the uploaded ${entry.path} into the content cache`, error);
+            } else {
+                try {
+                    rmSync(entry.localPath, { force: true });
+                } catch (error) {
+                    this.o.logger.error(`Could not delete the uploaded ${entry.path}, which the cache policy does not keep`, error);
+                }
             }
             this.byPath.delete(entry.path);
             this.onFinished?.(entry, node, nodeUid, throwaway);

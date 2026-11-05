@@ -134,6 +134,16 @@ export class ContentStore {
         await rm(this.localPathFor(nodeUid, true), { force: true });
     }
 
+    /**
+     * Deletes the throwaway cache (tmp/). Its copies only live while a file
+     * is open, so anything there at mount start or after unmount is a
+     * leftover (crash, SIGKILL, lazy unmount).
+     */
+    async wipeEphemeral(): Promise<void> {
+        this.logger.debug(`Wiping throwaway content cache under ${this.ephemeralDir}`);
+        await rm(this.ephemeralDir, { recursive: true, force: true });
+    }
+
     /** Deletes every cached blob (persistent and throwaway). Used by the ephemeral-cache mode. */
     async wipe(): Promise<void> {
         this.logger.debug(`Wiping content cache under ${this.persistentDir} and ${this.ephemeralDir}`);

@@ -22,6 +22,8 @@ interface OpenFile {
     entry?: PendingUpload;
     /** Its copy is in tmp/ (the path is not cacheable); dropped when the last handle on it closes. */
     ephemeral: boolean;
+    /** The Drive node whose local copy (blobs/ or tmp/) the fd is on; undefined while its content is pending. */
+    cacheUid?: string;
     /**
      * Its file was deleted or replaced while open. Reads and writes still go
      * to its fd, but like any unlinked file nothing of it reaches Drive.
@@ -109,14 +111,16 @@ export function createFuseOperations(
     // on Drive, like handles opened on it: a further write starts a
     // revision of it without a lookup. A revision's node is not passed, so
     // markDirty resolves it fresh (the handle's old node names the replaced
-    // revision). Outside the cache policy, PendingUploads left their content
-    // in tmp/, which the last of them drops on close.
-    pending.onFinished = (entry, node, _nodeUid, ephemeral) => {
+    // revision). Their fd is now on the cached copy of `nodeUid`: in tmp/
+    // for a path outside the cache policy, which the last of them drops on
+    // close (`ephemeral`), else in blobs/.
+    pending.onFinished = (entry, node, nodeUid, ephemeral) => {
         for (const file of openFiles.values()) {
             if (file.entry === entry) {
                 file.entry = undefined;
                 file.node = node;
                 file.ephemeral = ephemeral;
+                file.cacheUid = nodeUid;
             }
         }
     };
@@ -272,7 +276,7 @@ export function createFuseOperations(
                 const localPath = await content.ensureDownloaded(node, { ephemeral });
                 const { parent, name } = await tree.resolveParent(path);
                 const handle = await fsOpen(localPath, 'r+');
-                cb(0, register({ path, handle, node, parentUid: parent.uid, name, ephemeral, detached: false }));
+                cb(0, register({ path, handle, node, parentUid: parent.uid, name, ephemeral, cacheUid: node.uid, detached: false }));
             })
             .catch((err) => cb(errnoFor(err)));
     }
@@ -511,14 +515,14 @@ export function createFuseOperations(
                         pending.closed(file.entry);
                     }
                     // Once a revision started, the copy is in pending/: nothing to drop here.
-                    const node = file.node;
-                    if (file.ephemeral && !file.entry && node) {
+                    const uid = file.cacheUid;
+                    if (file.ephemeral && !file.entry && uid) {
                         const shared = [...openFiles.values()].some(
-                            (other) => other.ephemeral && !other.entry && other.node?.uid === node.uid,
+                            (other) => other.ephemeral && !other.entry && other.cacheUid === uid,
                         );
                         if (!shared) {
                             await content
-                                .forgetEphemeral(node.uid)
+                                .forgetEphemeral(uid)
                                 .catch((err) => logger.warn(`Could not remove the throwaway copy of ${file.path}: ${err}`));
                         }
                     }

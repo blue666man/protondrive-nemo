@@ -263,7 +263,8 @@ Two environment variables for `mount` narrow that down:
 - `PROTONDRIVE_NEMO_CACHE_PATHS`: a comma-separated list of Drive folders
   whose files may stay cached. Files elsewhere are still fully readable and
   writable, but their decrypted copy (under `tmp/`) is deleted as soon as the
-  last program using it closes the file.
+  last program using it closes the file (and anything left in `tmp/` by a crash is
+  cleared when the mount starts and stops).
 - `PROTONDRIVE_NEMO_EPHEMERAL_CACHE=1`: keep nothing. Every open uses a
   throwaway copy, and the whole content cache is wiped when the mount starts
   and when it stops.

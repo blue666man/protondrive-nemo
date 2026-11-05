@@ -204,6 +204,8 @@ test('a new allowlisted file is uploaded and kept in blobs/', async (t) => {
 test('truncate without a handle on a Drive file outside the allowlist uploads, then keeps no copy', async (t) => {
     const c = await cacheSetup(t, ['/Docs']);
     assert.deepEqual(await c.op('truncate', '/Other/b.txt', 0), [0]);
+    // Downloaded to tmp/, not blobs/ (whose directory nothing else here creates).
+    assert.ok(!existsSync(path.join(c.dir, 'blobs')));
     assert.equal((await c.pending.flush()).uploaded, 1);
     assert.equal(c.fake.contentOf(c.b), '');
     assert.ok(!existsSync(c.blob('blobs', c.b)));
@@ -255,6 +257,88 @@ test('a read-only handle outside the allowlist, open when the upload lands, drop
     assert.ok(!existsSync(c.blob('blobs', uid)));
 });
 
+test('a read-only handle outside the allowlist, open when a revision lands, drops the tmp/ copy on close', { timeout: 5000 }, async (t) => {
+    const c = await cacheSetup(t, ['/Docs']);
+    await c.overwrite('/Other/b.txt', 'HELLO');
+    const release = c.fake.holdUploads();
+    const flushed = c.pending.flush();
+    await waitFor(() => c.fake.inFlight === 1, 3000, 'the upload to start');
+    const [err, fd] = await c.op('open', '/Other/b.txt', 0);
+    assert.equal(err, 0);
+    release();
+    assert.equal((await flushed).uploaded, 1);
+    assert.equal(c.fake.contentOf(c.b), 'HELLO');
+    assert.ok(existsSync(c.blob('tmp', c.b)), 'the open handle still has it');
+    const buf = Buffer.alloc(5);
+    assert.deepEqual(await c.op('read', '/Other/b.txt', fd, buf, 5, 0), [5]);
+    assert.equal(buf.toString(), 'HELLO');
+    assert.deepEqual(await c.op('release', '/Other/b.txt', fd), [0]);
+    assert.ok(!existsSync(c.blob('tmp', c.b)));
+    assert.ok(!existsSync(c.blob('blobs', c.b)));
+});
+
+test('outside ephemeral mode, a file open as its upload lands during shutdown keeps its tmp/ copy', { timeout: 5000 }, async (t) => {
+    const c = await cacheSetup(t, ['/Docs']);
+    await c.overwrite('/Other/b.txt', 'HELLO');
+    const release = c.fake.holdUploads();
+    const flushed = c.pending.flush();
+    await waitFor(() => c.fake.inFlight === 1, 3000, 'the upload to start');
+    const [, fd] = await c.op('open', '/Other/b.txt', 0);
+    // The upload lands during the drain.
+    const stopped = c.pending.shutdown(2000);
+    release();
+    await flushed;
+    await stopped;
+    assert.equal(c.fake.contentOf(c.b), 'HELLO');
+    assert.ok(existsSync(c.blob('tmp', c.b)), 'the open handle still has it');
+
+    // The mount is still live until unmounted: a write through the handle is not lost.
+    const data = Buffer.from('again');
+    assert.deepEqual(await c.op('write', '/Other/b.txt', fd, data, data.length, 0), [data.length]);
+    const entry = c.pending.get('/Other/b.txt');
+    assert.ok(entry);
+    await entry.ready;
+    assert.equal(readFileSync(entry.localPath, 'utf8'), 'again');
+    assert.deepEqual(await c.op('release', '/Other/b.txt', fd), [0]);
+});
+
+test('with an allowlist, mount() clears tmp/ at start and in cleanup(), and keeps blobs/', async (t) => {
+    const m = await mountFake(
+        t,
+        undefined,
+        (cacheDir) => {
+            mkdirSync(path.join(cacheDir, 'tmp'), { recursive: true });
+            writeFileSync(path.join(cacheDir, 'tmp', 'x'), 'left by a crash');
+            mkdirSync(path.join(cacheDir, 'blobs'), { recursive: true });
+            writeFileSync(path.join(cacheDir, 'blobs', 'y'), 'cached');
+        },
+        { cachePaths: ['/Docs'] },
+    );
+    assert.ok(!existsSync(path.join(m.cacheDir, 'tmp', 'x')));
+    assert.ok(existsSync(path.join(m.cacheDir, 'blobs', 'y')));
+    mkdirSync(path.join(m.cacheDir, 'tmp'), { recursive: true });
+    writeFileSync(path.join(m.cacheDir, 'tmp', 'z'), 'open copy');
+    await m.handle.cleanup();
+    assert.ok(!existsSync(path.join(m.cacheDir, 'tmp')));
+    assert.ok(existsSync(path.join(m.cacheDir, 'blobs', 'y')));
+});
+
+test('with an allowlist, a second mount refused by the lock leaves tmp/ alone', { timeout: 5000 }, async (t) => {
+    const m = await mountFake(t, undefined, undefined, { cachePaths: ['/Docs'] });
+    mkdirSync(path.join(m.cacheDir, 'tmp'), { recursive: true });
+    writeFileSync(path.join(m.cacheDir, 'tmp', 'x'), 'open in mount #1');
+    const other = tempDir();
+    t.after(other.cleanup);
+    Fuse.reset();
+    await assert.rejects(
+        mount({ ...fakeDrive(m.cacheDir, { cachePaths: ['/Docs'] }), sdk: m.fake.client }, path.join(other.dir, 'mnt'), {
+            settleMs: 60_000,
+        }),
+        /already running for this account/,
+    );
+    assert.ok(existsSync(path.join(m.cacheDir, 'tmp', 'x')));
+});
+
 test('mount() applies the cache policy to uploads', async (t) => {
     const fake = new FakeDrive();
     fake.addFolder(fake.rootUid, 'Other');
@@ -296,7 +380,7 @@ test('the ephemeral wipe runs under the instance lock and leaves pending/ alone'
                 'unmount',
                 unmountStep(() => new Promise<void>((resolve, reject) => h.fuse.unmount((err) => (err ? reject(err) : resolve())))),
             ],
-            ['wipe the ephemeral cache', h.cleanup],
+            ['wipe the throwaway content cache', h.cleanup],
             ['release the instance lock', h.releaseLock],
         ],
         log: () => {},

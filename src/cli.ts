@@ -151,7 +151,7 @@ program
                     'unmount',
                     unmountStep(() => new Promise<void>((resolve, reject) => fuse.unmount((err) => (err ? reject(err) : resolve())))),
                 ],
-                ['wipe the ephemeral cache', cleanup],
+                ['wipe the throwaway content cache', cleanup],
                 ['release the instance lock', releaseLock],
                 ['close the session', () => d.dispose()],
             ],

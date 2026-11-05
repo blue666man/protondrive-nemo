@@ -27,7 +27,7 @@ export interface MountHandle {
     shutdownGraceMs: number;
     /** Releases the one-daemon-per-account lock; call it last, after unmounting. */
     releaseLock: () => Promise<void>;
-    /** Wipes the decrypted content cache in ephemeral mode. Call after unmounting, before releasing the lock. */
+    /** Wipes the throwaway content cache (tmp/), or all of it in ephemeral mode. Call after unmounting, before releasing the lock. */
     cleanup: () => Promise<void>;
 }
 
@@ -76,11 +76,10 @@ export async function mount(
     const releaseLock = await acquireInstanceLock(drive.config.cacheDir);
     let fuse: Fuse | undefined;
     try {
-        if (drive.config.ephemeralCache) {
-            // Under the lock: a second daemon must not wipe the first one's open copies.
-            // pending/ is not touched; the uploads waiting there resume below.
-            await content.wipe();
-        }
+        // Under the lock: a second daemon must not wipe the first one's open copies.
+        // pending/ is not touched; the uploads waiting there resume below. tmp/
+        // only holds copies of open files, so whatever is there was left by a crash.
+        await (drive.config.ephemeralCache ? content.wipe() : content.wipeEphemeral());
         // Before mounting, so files left over from the last run are visible from the start.
         await pending.resume();
         const { ops, hasUnsavedChanges } = createFuseOperations(drive.sdk, tree, content, policy, pending, drive.logger);
@@ -105,9 +104,7 @@ export async function mount(
         await ipc.start();
 
         const cleanup = async (): Promise<void> => {
-            if (drive.config.ephemeralCache) {
-                await content.wipe();
-            }
+            await (drive.config.ephemeralCache ? content.wipe() : content.wipeEphemeral());
         };
 
         return { fuse, ipc, pending, shutdownGraceMs, releaseLock, cleanup };
