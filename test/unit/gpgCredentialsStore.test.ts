@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
@@ -80,6 +80,30 @@ test('only ASCII-armoured ciphertext, mode 0600, is written to disk', async () =
         assert.ok(!onDisk.includes(value), `ciphertext contains ${value}`);
     }
     assert.equal(statSync(file).mode & 0o777, 0o600);
+});
+
+test('save() over an existing 0644 file replaces it atomically: mode 0600, no temp file left', async () => {
+    const file = credentialsFile();
+    const store = new GpgCredentialsStore(file, RECIPIENT, silentLogger);
+    await store.save(snapshot);
+    chmodSync(file, 0o644);
+    await store.save({ ...snapshot, userKeyPassword: 'user-key-pw-rotated' });
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+    assert.deepEqual(readdirSync(path.dirname(file)), ['auth-session.gpg']);
+    assert.deepEqual(await store.load(), { ...snapshot, userKeyPassword: 'user-key-pw-rotated' });
+});
+
+test('a failed save() leaves the previous file intact and no temp file behind', async () => {
+    const file = credentialsFile();
+    await new GpgCredentialsStore(file, RECIPIENT, silentLogger).save(snapshot);
+    const before = readFileSync(file);
+    // A target that is a non-empty directory makes the final rename fail.
+    const blocked = path.join(path.dirname(file), 'blocked');
+    mkdirSync(path.join(blocked, 'inside'), { recursive: true });
+    const store = new GpgCredentialsStore(blocked, RECIPIENT, silentLogger);
+    await assert.rejects(store.save(snapshot));
+    assert.deepEqual(readdirSync(path.dirname(file)).sort(), ['auth-session.gpg', 'blocked']);
+    assert.deepEqual(readFileSync(file), before);
 });
 
 test('load() returns null when there is no file', async () => {

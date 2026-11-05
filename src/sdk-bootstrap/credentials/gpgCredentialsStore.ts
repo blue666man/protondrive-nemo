@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 
 import { Logger, ValidationError } from '@protontech/drive-sdk';
@@ -80,9 +80,41 @@ export class GpgCredentialsStore implements CredentialsStore {
             ],
             Buffer.from(JSON.stringify(snapshot), 'utf8'),
         );
-        await mkdir(path.dirname(this.credentialsFile), { recursive: true });
-        await writeFile(this.credentialsFile, encrypted, { mode: 0o600 });
+        await this.writeAtomically(encrypted);
         this.logger.debug(`Wrote GPG-encrypted credentials to ${this.credentialsFile}`);
+    }
+
+    /**
+     * The session is re-saved on every token refresh, so a crash or a full
+     * disk mid-write must not leave a torn file: write a fresh 0600 temp file,
+     * fsync it, rename it over the old one and fsync the directory. The old
+     * file or the new one survives, never a truncated one.
+     */
+    private async writeAtomically(data: Buffer): Promise<void> {
+        const dir = path.dirname(this.credentialsFile);
+        const tmp = `${this.credentialsFile}.tmp`;
+        await mkdir(dir, { recursive: true });
+        // A leftover temp file would keep its old mode through open('w').
+        await rm(tmp, { force: true });
+        try {
+            const handle = await open(tmp, 'wx', 0o600);
+            try {
+                await handle.writeFile(data);
+                await handle.sync();
+            } finally {
+                await handle.close();
+            }
+            await rename(tmp, this.credentialsFile);
+        } catch (error: unknown) {
+            await rm(tmp, { force: true });
+            throw error;
+        }
+        const dirHandle = await open(dir, 'r');
+        try {
+            await dirHandle.sync();
+        } finally {
+            await dirHandle.close();
+        }
     }
 
     async remove(): Promise<void> {

@@ -55,6 +55,9 @@ Changes from upstream (mechanical, except the credentials store below):
     `clear` is needed because mechanisms set in `gpg.conf` otherwise still
     apply. Decryption passes `--no-auto-key-retrieve` too, so no key is
     fetched there either.
+  - the file is written atomically (0600 temp file, fsync, rename, directory
+    fsync) instead of `writeFile` in place: the session is re-saved on every
+    token refresh, and a torn file would force a re-login.
   The session is encrypted to `PROTONDRIVE_NEMO_GPG_RECIPIENT` and kept in
   `PROTONDRIVE_NEMO_CREDENTIALS_FILE` (default `<appDir>/auth-session.gpg`);
   decryption goes through `gpg-agent`. There is no keychain fallback, and
