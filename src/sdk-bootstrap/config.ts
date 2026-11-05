@@ -65,7 +65,9 @@ export interface Config {
      * `<appDir>/auth-session.gpg`. `PROTONDRIVE_NEMO_CREDENTIALS_FILE`
      * overrides it for the default profile only; every other `--account`
      * always uses its own `<appDir>/auth-session.gpg`, so profiles never
-     * share (and overwrite) one session file.
+     * share (and overwrite) one session file. Saving renames a new file
+     * into place, so a symlink here is replaced by a regular file on the
+     * next save (its target is left untouched): give the real path.
      */
     credentialsFile: string;
 

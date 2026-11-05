@@ -107,6 +107,9 @@ in
         Path to the GPG-encrypted session file of the default account
         (`PROTONDRIVE_NEMO_CREDENTIALS_FILE`). Other `--account` profiles
         ignore it and keep `auth-session.gpg` in their own data directory.
+        Saving renames a new file into place, so if this path is a symlink
+        it is replaced by a regular file on the next save (the link's target
+        is left untouched); give the real path.
       '';
     };
 

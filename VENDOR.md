@@ -60,7 +60,10 @@ Changes from upstream (mechanical, except the credentials store below):
     of `writeFile` in place: the session is re-saved on every token refresh,
     and a torn file would force a re-login. The unique name keeps two
     concurrent saves of one profile from unlinking or renaming each other's
-    half-written temp file.
+    half-written temp file. Because the new file is renamed into place, a
+    credentials file that is a symlink is replaced by a regular file on the
+    next save (the link's target is left as it was); point
+    `PROTONDRIVE_NEMO_CREDENTIALS_FILE` at the real path instead.
   - a missing `gpg` binary is reported as "gpg not found on PATH (install
     GnuPG)" instead of a bare `spawn gpg ENOENT` or a decrypt error.
   The session is encrypted to `PROTONDRIVE_NEMO_GPG_RECIPIENT` and kept in
