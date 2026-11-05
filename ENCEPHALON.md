@@ -30,6 +30,10 @@ Every one has `(encephalon)` in its subject, so `git log --first-parent
 13. `docs(encephalon): build with npm ci --ignore-scripts and the patched native rebuild`
 14. `docs(encephalon): the mount is started by hand; the systemd units are unsupported here`
 15. `docs(encephalon): on-top commits listed by subject; dated rebuild tags`
+16. `fix(encephalon): each session save writes its own temp file`
+17. `docs(encephalon): a symlinked credentials file becomes a regular file on save`
+18. `docs(encephalon): README Build explains the skipped install scripts cleanly`
+19. `docs(encephalon): commit list follows the review follow-ups`
 
 **Rebuilding after a PR branch moves:**
 
