@@ -39,10 +39,17 @@ Changes from upstream, all mechanical (no logic changes):
 
 - `cache/sqliteCache.ts`: `bun:sqlite``Database` → `better-sqlite3`.
 - `clientUid.ts`: `Bun.file`/`Bun.write` → `node:fs/promises`.
-- `credentials/secretCredentialsStore.ts`: `Bun.secrets` → `keytar`, and the
-  keychain service name was changed from `ch.proton.drive/drive-sdk-cli`
-  (the official CLI's) to `ch.proton.drive/protondrive-nemo` so this tool's
-  session doesn't collide with the official CLI's if both are installed.
+- `credentials/secretCredentialsStore.ts` (`Bun.secrets` in upstream, then
+  `keytar` here) was replaced by the GnuPG store
+  `credentials/gpgCredentialsStore.ts` from
+  [NioZow/protondrive-fuse](https://github.com/NioZow/protondrive-fuse)
+  (commit `ccc0c22`), copied verbatim apart from env var names in comments.
+  The session is encrypted to `PROTONDRIVE_NEMO_GPG_RECIPIENT` and kept in
+  `PROTONDRIVE_NEMO_CREDENTIALS_FILE` (default `<appDir>/auth-session.gpg`);
+  decryption goes through `gpg-agent`. There is no keychain fallback, and
+  `keytar` (with `credentials/constants.ts`, which only it used) is gone.
+  `credentials/index.ts` and the `gpgRecipient`/`credentialsFile` parts of
+  `config.ts` follow NioZow's versions.
 - Dropped `credentials/passCredentialsStore.ts` (pass(1) support) and the
   CLI's own command/REPL/telemetry layers — out of scope for a FUSE daemon.
 - `api/serverTimeHook.ts`: added straight from upstream commit

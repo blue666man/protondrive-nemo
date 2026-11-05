@@ -15,7 +15,7 @@ import { guardedShutdown, type ShutdownRun, unmountStep } from './shutdown';
 const APP_VERSION = 'external-drive-protondrive_nemo@0.1.0-alpha';
 const DISCLOSURE = 'protondrive-nemo is a third-party application, not officially supported by Proton.';
 
-const ACCOUNT_OPTION = ['-a, --account <name>', 'account profile (isolates keychain entry, cache/app dirs, and default mount point)'] as const;
+const ACCOUNT_OPTION = ['-a, --account <name>', 'account profile (isolates credentials file, cache/app dirs, and default mount point)'] as const;
 
 function defaultMountPointFor(account?: string): string {
     const resolved = account ?? 'default';

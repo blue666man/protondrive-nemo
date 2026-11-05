@@ -28,7 +28,7 @@ export async function initDrive(configOptions: InitConfig) {
     const logger: Logger = new ConsoleLogger(config.logLevel);
 
     const openPGPCryptoModule = initOpenPGPCryptoModule();
-    const credentials = initCredentials(config.profile, logger);
+    const credentials = initCredentials(config, logger);
     const { auth, addresses, srp, apiClient, httpClient } = await initApi(config, credentials, logger, CryptoProxy);
 
     const clientUid = await getOrGenerateClientUid(config, logger);

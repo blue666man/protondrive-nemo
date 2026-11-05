@@ -28,12 +28,22 @@ a real FUSE filesystem, so file-manager integration comes for free.
   (an actively maintained N-API FUSE binding). See
   [Architecture](#architecture) below for how FUSE calls map to Drive API
   calls.
-- **Session storage**: your login session is stored in the OS keychain via
-  `keytar` (libsecret/GNOME Keyring on Linux), under its own service name
-  — separate from Proton's official `proton-drive` CLI, so both can be
-  installed without conflicting. The keychain *account* name is scoped by
-  `--account` (`auth-session` for the default account, `auth-session-<name>`
-  for others) — see [Multiple accounts](#multiple-accounts).
+- **Session storage**: your login session (which unlocks the whole Proton
+  account) is encrypted with GnuPG to the key named by
+  `PROTONDRIVE_NEMO_GPG_RECIPIENT` (a key id, fingerprint or user id) and
+  written to a local file. This store comes from
+  [NioZow/protondrive-fuse](https://github.com/NioZow/protondrive-fuse).
+  Only ciphertext ever touches disk; decryption happens in memory through
+  your `gpg-agent`, so this tool never asks for or holds a passphrase. The
+  agent must therefore be able to use the secret key when you run `login` or
+  `mount` (unlock it beforehand, or have a pinentry available to prompt).
+  - `PROTONDRIVE_NEMO_GPG_RECIPIENT` is **required**: there is no OS
+    keychain and no passphrase fallback, and `login`/`mount` refuse to start
+    without it.
+  - `PROTONDRIVE_NEMO_CREDENTIALS_FILE` overrides where the encrypted
+    session is kept; the default is `auth-session.gpg` in the account's app
+    data dir (`$XDG_DATA_HOME/protondrive-nemo[-<name>]/`), so each
+    `--account` gets its own file — see [Multiple accounts](#multiple-accounts).
 
 ## Requirements
 
@@ -41,8 +51,9 @@ a real FUSE filesystem, so file-manager integration comes for free.
   distros, including Linux Mint, have one of these by default) and
   `libfuse-dev` to build the native binding.
 - Node.js 20+.
-- A Secret Service provider for session storage (GNOME Keyring, which Linux
-  Mint ships by default, or KWallet with the appropriate libsecret backend).
+- GnuPG (`gpg` on `PATH`) with a key you can decrypt with through
+  `gpg-agent` (plus a pinentry if the key has a passphrase), for session
+  storage.
 
 ## Build
 
@@ -144,7 +155,7 @@ nemo -q                                    # restart Nemo to pick it up
 ### Multiple accounts
 
 Every command takes `-a, --account <name>` to operate on an isolated
-account profile: its own keychain session, its own cache/app dir
+account profile: its own credentials file, its own cache/app dir
 (`$XDG_CACHE_HOME/protondrive-nemo-<name>`,
 `$XDG_DATA_HOME/protondrive-nemo-<name>`), and its own default mount point
 (`~/ProtonDrive-<name>`). Omitting `--account` (or passing `--account

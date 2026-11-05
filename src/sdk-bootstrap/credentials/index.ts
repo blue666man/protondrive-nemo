@@ -1,15 +1,22 @@
-import { Logger } from '@protontech/drive-sdk';
+import { Logger, ValidationError } from '@protontech/drive-sdk';
 
+import type { Config } from '../config';
 import { Credentials } from './credentials';
-import { SecretsSessionStore } from './secretCredentialsStore';
+import { GpgCredentialsStore } from './gpgCredentialsStore';
 
 export type { Credentials } from './credentials';
 
 /**
- * Simplified from ProtonDriveApps/sdk `cli/src/credentials/index.ts`: the CLI
- * supports switchable stores (OS keychain, pass(1), plaintext file); this app
- * only needs the OS keychain (libsecret via keytar). See ../../../VENDOR.md.
+ * The only credentials store: the session is kept in a local file encrypted
+ * with GnuPG to the recipient key named by `PROTONDRIVE_NEMO_GPG_RECIPIENT`. There
+ * is no OS keychain or passphrase fallback.
  */
-export function initCredentials(profile: string, logger: Logger): Credentials {
-    return new Credentials(new SecretsSessionStore(profile, logger), logger);
+export function initCredentials(config: Config, logger: Logger): Credentials {
+    if (!config.gpgRecipient) {
+        throw new ValidationError(
+            'PROTONDRIVE_NEMO_GPG_RECIPIENT is not set. It must name the GPG key the stored session is encrypted to (there is no keychain or passphrase fallback).',
+        );
+    }
+    const store = new GpgCredentialsStore(config.credentialsFile, config.gpgRecipient, logger);
+    return new Credentials(store, logger);
 }

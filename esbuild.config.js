@@ -3,7 +3,7 @@
 // dist/cli.js: `require()` can't load a .ts file. esbuild transpiles
 // anything it bundles regardless of whether it lives in node_modules, so it
 // bundles our own src/ together with that raw-TS dependency into one plain
-// CommonJS file. Native addons (fuse binding, sqlite, keytar) are kept
+// CommonJS file. Native addons (fuse binding, sqlite) are kept
 // external and loaded via require() at runtime instead of being bundled.
 const esbuild = require('esbuild');
 const fs = require('node:fs');
@@ -12,7 +12,7 @@ const fs = require('node:fs');
 // locate a helper script it ships — bundling it into our CJS output turns
 // that into `undefined` and it throws immediately. Left external and
 // dynamically `import()`-ed at its one call site instead (see src/cli.ts).
-const EXTERNAL = ['@cocalc/fuse-native', 'better-sqlite3', 'keytar', 'open'];
+const EXTERNAL = ['@cocalc/fuse-native', 'better-sqlite3', 'open'];
 
 async function main() {
     await esbuild.build({

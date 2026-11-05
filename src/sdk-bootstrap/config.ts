@@ -10,7 +10,7 @@ export interface InitConfig {
     sdkVersion?: string;
     clientUidPrefix: string;
     enablePersistedEvents?: boolean;
-    /** Account profile, isolating keychain entry, cache/app dirs, and default mount point. Defaults to `'default'`. */
+    /** Account profile, isolating the credentials file, cache/app dirs, and default mount point. Defaults to `'default'`. */
     profile?: string;
     /**
      * Remote folder paths whose files may be kept in the persistent local
@@ -54,6 +54,19 @@ export interface Config {
     logLevel: LogLevel;
 
     /**
+     * GPG key id/fingerprint (set `PROTONDRIVE_NEMO_GPG_RECIPIENT`). The stored
+     * session is encrypted to this key and decrypted in memory through the
+     * user's gpg-agent. Required: there is no keychain or passphrase fallback.
+     */
+    gpgRecipient?: string;
+    /**
+     * Absolute path to the GPG-encrypted credentials file. Only ciphertext is
+     * written here; plaintext credentials never touch disk. Defaults to
+     * `<appDir>/auth-session.gpg` (override with `PROTONDRIVE_NEMO_CREDENTIALS_FILE`).
+     */
+    credentialsFile: string;
+
+    /**
      * Remote folder paths (POSIX-style, under "My Files") whose files may be
      * kept in the persistent local cache. Empty = every file may be cached.
      * Files outside these folders are still readable, but their decrypted copy
@@ -83,6 +96,10 @@ export function getConfig(options: InitConfig): Config {
 
     const baseUrl = process.env.PROTONDRIVE_NEMO_BASE_URL || 'drive-api.proton.me';
 
+    const gpgRecipient = process.env.PROTONDRIVE_NEMO_GPG_RECIPIENT || undefined;
+    const credentialsFile =
+        process.env.PROTONDRIVE_NEMO_CREDENTIALS_FILE || path.join(appDir, 'auth-session.gpg');
+
     const cachePaths = options.cachePaths ?? parsePathList(process.env.PROTONDRIVE_NEMO_CACHE_PATHS);
     const ephemeralCache = options.ephemeralCache ?? isTruthy(process.env.PROTONDRIVE_NEMO_EPHEMERAL_CACHE);
 
@@ -98,6 +115,8 @@ export function getConfig(options: InitConfig): Config {
         appDir,
         enablePersistedEvents: options.enablePersistedEvents ?? true,
         logLevel,
+        gpgRecipient,
+        credentialsFile,
         cachePaths,
         ephemeralCache,
     };
@@ -130,9 +149,9 @@ function accountUrlFromBaseUrl(baseUrl: string): string {
 }
 
 /**
- * `profile` gets interpolated straight into filesystem paths and a keychain
- * account name below, so this isn't cosmetic — an unvalidated value (e.g.
- * containing `..` or `/`) would be a path-traversal bug.
+ * `profile` gets interpolated straight into filesystem paths below, so this
+ * isn't cosmetic — an unvalidated value (e.g. containing `..` or `/`) would be
+ * a path-traversal bug.
  */
 function validateProfileName(profile: string): void {
     if (!/^[A-Za-z0-9_-]+$/.test(profile)) {
