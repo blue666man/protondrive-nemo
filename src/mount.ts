@@ -1,4 +1,3 @@
-import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 
 import Fuse from '@cocalc/fuse-native';
@@ -52,8 +51,6 @@ export async function mount(
     const settleMs = options.settleMs ?? msFromEnv('PROTONDRIVE_NEMO_SETTLE_MS', 2000);
     const shutdownGraceMs = options.shutdownGraceMs ?? msFromEnv('PROTONDRIVE_NEMO_SHUTDOWN_GRACE_MS', 10_000);
 
-    await mkdir(mountPoint, { recursive: true });
-
     const tree = new DriveTree(drive.sdk, drive.logger);
     const contentCacheDir = `${drive.config.cacheDir}/blobs`;
     const content = new ContentStore(drive.sdk, contentCacheDir, drive.logger);
@@ -77,6 +74,10 @@ export async function mount(
 
         const isDefaultProfile = drive.config.profile === 'default';
         const mounting = new Fuse(mountPoint, ops, {
+            // force: a mount left by a killed daemon (ENOTCONN) is lazily
+            // unmounted first. mkdir: creates a missing mount point. Our own
+            // mkdir must not run before this: on a dead mount it fails with
+            // ENOTCONN before force can clear it.
             force: true,
             mkdir: true,
             fsname: isDefaultProfile ? 'protondrive-nemo' : `protondrive-nemo-${drive.config.profile}`,
