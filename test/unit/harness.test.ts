@@ -17,6 +17,7 @@ beforeEach(() => {
 
 afterEach(async () => {
     await handle?.ipc.stop();
+    await handle?.releaseLock();
     handle = undefined;
     tmp.cleanup();
 });

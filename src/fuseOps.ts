@@ -1,58 +1,52 @@
-import { constants as fsConstants } from 'node:fs';
-import { open as fsOpen, stat as fsStat, truncate as fsTruncate, type FileHandle } from 'node:fs/promises';
+import { constants as fsConstants, type Stats } from 'node:fs';
+import { open as fsOpen, stat as fsStat, truncate as fsTruncate, utimes as fsUtimes, type FileHandle } from 'node:fs/promises';
 
 import Fuse from '@cocalc/fuse-native';
-import { MemberRole, NodeType } from '@protontech/drive-sdk';
+import { NodeType } from '@protontech/drive-sdk';
 import type { Logger, NodeEntity, ProtonDriveClient } from '@protontech/drive-sdk';
 
 import type { CachePolicy } from './cachePolicy';
 import { ContentStore } from './contentStore';
 import { DriveTree, NodeNotFoundError } from './driveTree';
+import type { PendingUpload, PendingUploads } from './pendingUploads';
 
 interface OpenFile {
+    /** Path under the mount; follows renames. */
     path: string;
-    node: NodeEntity;
-    localPath: string;
     handle: FileHandle;
-    dirty: boolean;
-    isNewFile: boolean;
-    /** True when the policy says this file's content must not persist locally; removed when the last handle closes. */
-    ephemeral: boolean;
+    /** The Drive file this handle was opened on; undefined for a file not on Drive yet. */
+    node?: NodeEntity;
     parentUid: string;
     name: string;
+    /** The pending upload this handle holds a reference on, once its content is pending. */
+    entry?: PendingUpload;
+    /**
+     * Its file was deleted or replaced while open. Reads and writes still go
+     * to its fd, but like any unlinked file nothing of it reaches Drive.
+     */
+    detached: boolean;
 }
 
 /**
- * Shared, ref-counted state for a path that's been create()'d but not yet
- * uploaded, tracked across every fd opened against it (not just the
- * original creator's). Some writers — the xdg-document-portal, and
- * Chromium's own download code — create the file, close that fd almost
- * immediately with nothing written (a "claim the name" step), then reopen
- * the same path moments later to do the real writing. A single fd's
- * release() can't tell that apart from a genuine empty file (e.g. `touch`),
- * so finalizing is driven by refCount + a short grace window instead of by
- * any one fd's close.
+ * Drive keeps two times per file: the server's ModifyTime
+ * (`node.modificationTime`, which also changes on rename and move) and the
+ * time the uploading client claimed for the content
+ * (`activeRevision.claimedModificationTime`, or
+ * `folder.claimedModificationTime`). mtime is the claimed time when there is
+ * one, so copies keep their times; ctime is the server time.
  */
-interface NewFileState {
-    parentUid: string;
-    name: string;
-    localPath: string;
-    node: NodeEntity;
-    dirty: boolean;
-    refCount: number;
-    finalizeTimer: NodeJS.Timeout | null;
-}
-
-function statFor(node: NodeEntity): Fuse.Stats {
+export function statFor(node: NodeEntity): Fuse.Stats {
     const isFolder = node.type === NodeType.Folder;
     const size = isFolder ? 4096 : (node.activeRevision?.claimedSize ?? 0);
-    const mtime = node.modificationTime ?? new Date();
+    const serverTime = node.modificationTime ?? new Date();
+    const claimed = isFolder ? node.folder?.claimedModificationTime : node.activeRevision?.claimedModificationTime;
+    const mtime = claimed ?? serverTime;
     const uid = process.getuid ? process.getuid() : 0;
     const gid = process.getgid ? process.getgid() : 0;
     return {
         mtime,
         atime: mtime,
-        ctime: mtime,
+        ctime: serverTime,
         nlink: 1,
         size,
         mode: isFolder ? fsConstants.S_IFDIR | 0o755 : fsConstants.S_IFREG | 0o644,
@@ -61,8 +55,8 @@ function statFor(node: NodeEntity): Fuse.Stats {
     } as Fuse.Stats;
 }
 
-async function statForOpenFile(file: OpenFile): Promise<Fuse.Stats> {
-    const local = await fsStat(file.localPath);
+/** A file whose content is not on Drive yet: its local copy is the truth. */
+function statForLocal(local: Stats): Fuse.Stats {
     const uid = process.getuid ? process.getuid() : 0;
     const gid = process.getgid ? process.getgid() : 0;
     return {
@@ -77,32 +71,24 @@ async function statForOpenFile(file: OpenFile): Promise<Fuse.Stats> {
     } as Fuse.Stats;
 }
 
-function placeholderNode(path: string, name: string): NodeEntity {
-    return {
-        uid: `pending:${path}`,
-        name: { ok: true, value: name },
-        type: NodeType.File,
-        keyAuthor: {} as NodeEntity['keyAuthor'],
-        nameAuthor: {} as NodeEntity['nameAuthor'],
-        directRole: MemberRole.Editor,
-        ownedBy: {},
-        isShared: false,
-        isSharedByUrl: false,
-        creationTime: new Date(),
-        modificationTime: new Date(),
-        treeEventScopeId: '',
-    };
+/**
+ * libfuse 2 passes UTIME_NOW and UTIME_OMIT as tv_sec 0 plus a marker
+ * tv_nsec, which fuse-native turns into ~1073 ms after the epoch. The two
+ * read the same, so both mean "leave this time unchanged".
+ */
+function isUtimeMarker(ms: number): boolean {
+    return ms >= 0 && ms < 2000;
 }
 
 /**
  * FUSE operation handlers backing the `~/ProtonDrive` mount. Only "My
  * Files" is exposed (no Trash/Devices/Shared/Photos in v1). Content is
- * fully materialized locally on open and uploaded on release — see
- * contentStore.ts.
+ * fully materialized locally on open; changes are uploaded by
+ * PendingUploads once the file has settled — see pendingUploads.ts.
  */
 export interface FuseOperationsHandle {
     ops: Fuse.OPERATIONS;
-    /** True if the path has a locally open handle with changes not yet uploaded (dirty write or brand-new file). */
+    /** True if the path has changes that are not on Drive yet. */
     hasUnsavedChanges: (path: string) => boolean;
 }
 
@@ -111,89 +97,175 @@ export function createFuseOperations(
     tree: DriveTree,
     content: ContentStore,
     policy: CachePolicy,
+    pending: PendingUploads,
     logger: Logger,
 ): FuseOperationsHandle {
     const openFiles = new Map<number, OpenFile>();
-    // Mirrors openFiles, keyed by path: a file that was just create()'d
-    // doesn't exist as a Drive node yet (it's uploaded on release), but the
-    // kernel calls getattr() on it immediately as part of completing the
-    // create — this is how getattr answers for it in the meantime.
-    const openFilesByPath = new Map<string, OpenFile>();
-    // Keyed by path, one entry per path currently in "just created, not yet
-    // uploaded" limbo — shared across every fd opened against that path.
-    const newFileStates = new Map<string, NewFileState>();
     let nextFd = 1000;
 
-    // Long enough to cover the create→close→reopen-to-write idiom observed
-    // from both xdg-document-portal and Chromium's own download code
-    // (reopen followed within single-digit milliseconds in practice), short
-    // enough not to be perceptible for a genuine empty-file create.
-    const NEW_FILE_FINALIZE_GRACE_MS = 500;
+    // Handles still open on an upload that just finished now hold that file
+    // on Drive, like handles opened on it: a further write starts a
+    // revision of it without a lookup. A revision's node is not passed, so
+    // markDirty resolves it fresh (the handle's old node names the replaced
+    // revision).
+    pending.onFinished = (entry, node) => {
+        for (const file of openFiles.values()) {
+            if (file.entry === entry) {
+                file.entry = undefined;
+                file.node = node;
+            }
+        }
+    };
 
-    async function openLocal(
-        path: string,
-        node: NodeEntity,
-        localPath: string,
-        extra: Omit<OpenFile, 'path' | 'node' | 'localPath' | 'handle'>,
-    ): Promise<number> {
-        const handle = await fsOpen(localPath, 'r+');
+    function register(file: OpenFile): number {
         const fd = nextFd++;
-        const file: OpenFile = { path, node, localPath, handle, ...extra };
         openFiles.set(fd, file);
-        openFilesByPath.set(path, file);
         return fd;
     }
 
-    async function finalizeNewFile(path: string, state: NewFileState): Promise<void> {
-        newFileStates.delete(path);
-        try {
-            const created = await content.uploadNewFile(state.parentUid, state.name, state.localPath);
-            tree.rememberNode(created);
-            tree.invalidate(state.parentUid);
-            await content.forget(state.node.uid);
-        } catch (err) {
-            logger.error(`Failed to upload ${state.name} on release`, err);
-        }
-        const rep = openFilesByPath.get(path);
-        if (rep && rep.node.uid === state.node.uid) {
-            openFilesByPath.delete(path);
-        }
+    /** Open handles on `path` that still belong to a live file (not to one deleted while open). */
+    function handlesOn(path: string): OpenFile[] {
+        return [...openFiles.values()].filter((file) => file.path === path && !file.detached && !file.entry?.cancelled);
     }
 
     /**
-     * Removes a non-cacheable file's throwaway copy, but only once no other
-     * handle (or pending create) still points at the same local file — the
-     * kernel can have several fds open on one path.
+     * The file at `path` is going away (unlinked, or replaced by a rename):
+     * its open handles keep only their fds. Returns them, for
+     * `reattachHandles` should the operation fail.
      */
-    async function evictIfUnused(file: OpenFile): Promise<void> {
-        for (const other of openFiles.values()) {
-            if (other.localPath === file.localPath) {
-                return;
-            }
+    function detachHandles(path: string): OpenFile[] {
+        const files = handlesOn(path);
+        for (const file of files) {
+            file.detached = true;
         }
-        const pending = newFileStates.get(file.path);
-        if (pending && pending.localPath === file.localPath) {
+        return files;
+    }
+
+    /** Undoes `detachHandles` after the operation failed and the file stayed. */
+    function reattachHandles(files: OpenFile[]): void {
+        for (const file of files) {
+            file.detached = false;
+        }
+    }
+
+    /** Starts a pending revision of the Drive file at `path`, shared by every handle open on it. */
+    function startRevision(path: string, node: NodeEntity, parentUid: string, name: string): PendingUpload {
+        const handles = handlesOn(path);
+        const entry = pending.beginRevision(path, node, parentUid, name, handles.length);
+        for (const handle of handles) {
+            handle.entry = entry;
+        }
+        return entry;
+    }
+
+    /** Points `file` at `entry`, holding a reference on it (which `release` gives back) unless it already does. */
+    function attach(file: OpenFile, entry: PendingUpload): void {
+        if (file.entry !== entry) {
+            pending.opened(entry);
+            file.entry = entry;
+        }
+    }
+
+    /** After a write or truncate through `file`: make sure its content gets uploaded. */
+    async function markDirty(file: OpenFile): Promise<void> {
+        if (file.detached || file.entry?.cancelled) {
+            return; // deleted while open: like any unlinked file, the writes go nowhere
+        }
+        const current = pending.get(file.path);
+        if (current) {
+            attach(file, current);
+            pending.touched(current);
             return;
         }
-        await content
-            .forget(file.node.uid)
-            .catch((err) => logger.warn(`Failed to remove cached copy of ${file.name}: ${err}`));
+        // On Drive only: this change starts a new revision of it.
+        const node = file.entry === undefined && file.node ? file.node : await tree.resolve(file.path);
+        const raced = pending.get(file.path); // a concurrent write may have started it meanwhile
+        if (raced) {
+            attach(file, raced);
+            pending.touched(raced);
+            return;
+        }
+        startRevision(file.path, node, file.parentUid, file.name);
+    }
+
+    /** Resolves if `path` exists, as a pending file or on Drive. */
+    async function requireExists(path: string): Promise<void> {
+        if (path !== '/' && !pending.has(path)) {
+            await tree.resolve(path);
+        }
+    }
+
+    /** The Drive node at `path`, or undefined if there is none. Any other failure propagates (EIO). */
+    async function resolveIfExists(path: string): Promise<NodeEntity | undefined> {
+        try {
+            return await tree.resolve(path);
+        } catch (err) {
+            if (err instanceof NodeNotFoundError) {
+                return undefined;
+            }
+            throw err;
+        }
+    }
+
+    /** True if folder `uid` holds anything, on Drive or pending. */
+    async function hasChildren(uid: string): Promise<boolean> {
+        return (await tree.listChildren(uid)).size > 0 || pending.inFolder(uid).length > 0;
     }
 
     /**
-     * Existence check for the metadata no-ops below: root, a file created
-     * moments ago that isn't a Drive node yet, or a resolvable node. Lets
-     * access succeed on real paths while still returning ENOENT for paths
-     * that don't exist.
+     * Throws unless rename() may replace what is at `dest` (Drive node
+     * `existing`, or else a pending file): only a file may replace a file,
+     * and only a folder an empty folder. Drive would trash a folder with
+     * everything in it.
      */
-    function requirePath(path: string): Promise<void> {
-        if (path === '/') {
-            return Promise.resolve();
+    async function checkReplaceable(srcIsFolder: boolean, dest: string, existing: NodeEntity | undefined): Promise<void> {
+        const destIsFolder = existing?.type === NodeType.Folder;
+        if (destIsFolder && !srcIsFolder) {
+            throw errnoError('EISDIR', `${dest} is a folder`);
         }
-        if (newFileStates.has(path) || openFilesByPath.has(path)) {
-            return Promise.resolve();
+        if (!destIsFolder && srcIsFolder) {
+            throw errnoError('ENOTDIR', `${dest} is not a folder`);
         }
-        return tree.resolve(path).then(() => undefined);
+        if (destIsFolder && (await hasChildren(existing.uid))) {
+            throw errnoError('ENOTEMPTY', `${dest} is not empty`);
+        }
+    }
+
+    /** Trashes `uid` on Drive and forgets it; `onTrashed` runs as soon as Drive has trashed it. */
+    async function trash(uid: string, onTrashed?: () => void): Promise<void> {
+        await drain(sdk.trashNodes([uid]));
+        onTrashed?.();
+        tree.forgetNode(uid);
+        await content.forget(uid);
+    }
+
+    /** Drops the pending entry at `path` (PendingUploads trashes anything its upload put on Drive anyway). */
+    async function cancelPending(path: string): Promise<void> {
+        await pending.cancel(path);
+    }
+
+    function retargetHandles(src: string, dest: string, parentUid: string, name: string): void {
+        for (const file of openFiles.values()) {
+            if (file.path === src) {
+                file.path = dest;
+                file.parentUid = parentUid;
+                file.name = name;
+            } else if (file.path.startsWith(`${src}/`)) {
+                file.path = dest + file.path.slice(src.length);
+            }
+        }
+    }
+
+    function openFromDrive(path: string, cb: (err: number, fd?: number) => void): void {
+        tree
+            .resolve(path)
+            .then(async (node) => {
+                const localPath = await content.ensureDownloaded(node);
+                const { parent, name } = await tree.resolveParent(path);
+                const handle = await fsOpen(localPath, 'r+');
+                cb(0, register({ path, handle, node, parentUid: parent.uid, name, detached: false }));
+            })
+            .catch((err) => cb(errnoFor(err)));
     }
 
     const ops: Fuse.OPERATIONS = {
@@ -211,11 +283,17 @@ export function createFuseOperations(
                 } as Fuse.Stats);
                 return;
             }
-            const openFile = openFilesByPath.get(path);
-            if (openFile) {
-                statForOpenFile(openFile)
-                    .then((stat) => cb(0, stat))
-                    .catch((err) => cb(errnoFor(err)));
+            const entry = pending.get(path);
+            if (entry) {
+                entry.ready
+                    .then(() => fsStat(entry.localPath))
+                    .then(statForLocal)
+                    // Landed and moved into the content cache meanwhile: Drive has it now.
+                    .catch(() => tree.resolve(path).then(statFor))
+                    .then(
+                        (stat) => cb(0, stat),
+                        (err) => cb(errnoFor(err)),
+                    );
                 return;
             }
             tree
@@ -227,7 +305,7 @@ export function createFuseOperations(
         // No permission model to enforce beyond the fixed modes getattr()
         // reports (see statFor): any existing path is accessible.
         access(path, _mode, cb) {
-            requirePath(path)
+            requireExists(path)
                 .then(() => cb(0))
                 .catch((err) => cb(errnoFor(err)));
         },
@@ -275,80 +353,53 @@ export function createFuseOperations(
 
         readdir(path, cb) {
             (path === '/' ? tree.getRootUid() : tree.resolve(path).then((n) => n.uid))
-                .then((parentUid) => tree.listChildren(parentUid))
-                .then((children) => cb(0, [...children.keys()]))
+                .then(async (parentUid) => {
+                    const names = new Set((await tree.listChildren(parentUid)).keys());
+                    // Files not on Drive yet are listed too.
+                    for (const entry of pending.inFolder(parentUid)) {
+                        names.add(entry.name);
+                    }
+                    cb(0, [...names]);
+                })
                 .catch((err) => cb(errnoFor(err)));
         },
 
         open(path, _flags, cb) {
-            // A file created moments ago may still be sitting in the
-            // finalize grace window (or still uploading) — reopening it
-            // should read/write the same local copy, not fail because it's
-            // not a Drive node yet. Bumping refCount and clearing any
-            // pending finalize timer means the eventual close of *this*
-            // handle decides whether/when the upload actually happens.
-            const state = newFileStates.get(path);
-            if (state) {
-                state.refCount++;
-                if (state.finalizeTimer) {
-                    clearTimeout(state.finalizeTimer);
-                    state.finalizeTimer = null;
-                }
-                openLocal(path, state.node, state.localPath, {
-                    dirty: false,
-                    isNewFile: true,
-                    ephemeral: false,
-                    parentUid: state.parentUid,
-                    name: state.name,
-                })
-                    .then((fd) => cb(0, fd))
-                    .catch((err) => cb(errnoFor(err)));
+            // A pending file (just created, or changed and not uploaded yet) is
+            // served from its local copy, and the open handle holds off its
+            // upload until it is closed. This also covers the
+            // create→close→reopen-to-write idiom of xdg-document-portal and
+            // Chromium downloads.
+            const entry = pending.get(path);
+            if (entry) {
+                pending.opened(entry);
+                entry.ready
+                    .then(() => fsOpen(entry.localPath, 'r+'))
+                    .then((handle) =>
+                        cb(0, register({ path, handle, parentUid: entry.parentUid, name: entry.name, entry, detached: false })),
+                    )
+                    .catch((err) => {
+                        pending.closed(entry);
+                        if ((err as NodeJS.ErrnoException).code === 'ENOENT' && pending.get(path) !== entry) {
+                            // Its upload finished in the meantime, and moved the
+                            // content into the cache: it is a file on Drive now.
+                            openFromDrive(path, cb);
+                            return;
+                        }
+                        cb(errnoFor(err));
+                    });
                 return;
             }
-            tree
-                .resolve(path)
-                .then(async (node) => {
-                    const ephemeral = !policy.isCacheable(path);
-                    const localPath = await content.ensureDownloaded(node, { ephemeral });
-                    const { parent, name } = await tree.resolveParent(path);
-                    const fd = await openLocal(path, node, localPath, {
-                        dirty: false,
-                        isNewFile: false,
-                        ephemeral,
-                        parentUid: parent.uid,
-                        name,
-                    });
-                    cb(0, fd);
-                })
-                .catch((err) => cb(errnoFor(err)));
+            openFromDrive(path, cb);
         },
 
         create(path, _mode, cb) {
             tree
                 .resolveParent(path)
                 .then(async ({ parent, name }) => {
-                    const node = placeholderNode(path, name);
-                    const localPath = await content.createEmptyLocal(node.uid, {
-                        ephemeral: !policy.isCacheable(path),
-                    });
-                    const state: NewFileState = {
-                        parentUid: parent.uid,
-                        name,
-                        localPath,
-                        node,
-                        dirty: false,
-                        refCount: 1,
-                        finalizeTimer: null,
-                    };
-                    newFileStates.set(path, state);
-                    const fd = await openLocal(path, node, localPath, {
-                        dirty: false,
-                        isNewFile: true,
-                        ephemeral: false,
-                        parentUid: parent.uid,
-                        name,
-                    });
-                    cb(0, fd);
+                    const entry = await pending.createNew(path, parent.uid, name);
+                    const handle = await fsOpen(entry.localPath, 'r+');
+                    cb(0, register({ path, handle, parentUid: parent.uid, name, entry, detached: false }));
                 })
                 .catch((err) => cb(errnoFor(err)));
         },
@@ -373,15 +424,14 @@ export function createFuseOperations(
             }
             file.handle
                 .write(buffer, 0, length, position)
-                .then((res) => {
-                    file.dirty = true;
-                    const state = newFileStates.get(file.path);
-                    if (state) {
-                        state.dirty = true;
-                    }
+                .then(async (res) => {
+                    await markDirty(file);
                     cb(res.bytesWritten);
                 })
-                .catch(() => cb(0));
+                .catch((err) => {
+                    logger.error(`Write to ${file.path} failed`, err);
+                    cb(errnoFor(err));
+                });
         },
 
         ftruncate(_path, fd, size, cb) {
@@ -392,37 +442,30 @@ export function createFuseOperations(
             }
             file.handle
                 .truncate(size)
-                .then(() => {
-                    file.dirty = true;
-                    const state = newFileStates.get(file.path);
-                    if (state) {
-                        state.dirty = true;
-                    }
-                    cb(0);
-                })
+                .then(() => markDirty(file))
+                .then(() => cb(0))
                 .catch((err) => cb(errnoFor(err)));
         },
 
         truncate(path, size, cb) {
-            // A reopen with O_TRUNC of a still-pending new file arrives here
-            // (the kernel issues this as a separate call after open()) — it
-            // isn't a real Drive node yet, so tree.resolve() would 404.
-            const state = newFileStates.get(path);
-            if (state) {
-                fsTruncate(state.localPath, size)
-                    .then(() => {
-                        state.dirty = true;
-                        cb(0);
-                    })
-                    .catch((err) => cb(errnoFor(err)));
-                return;
-            }
-            tree
-                .resolve(path)
-                .then((node) => content.ensureDownloaded(node, { ephemeral: !policy.isCacheable(path) }))
-                .then((localPath) => fsTruncate(localPath, size))
-                .then(() => cb(0))
-                .catch((err) => cb(errnoFor(err)));
+            // Without a handle (e.g. `truncate -s`, or O_TRUNC on reopen, which
+            // the kernel sends as its own call). On a file already on Drive it
+            // starts a pending revision, like a write.
+            (async () => {
+                let entry = pending.get(path);
+                if (!entry) {
+                    const node = await tree.resolve(path);
+                    await content.ensureDownloaded(node);
+                    const { parent, name } = await tree.resolveParent(path);
+                    entry = pending.get(path) ?? startRevision(path, node, parent.uid, name);
+                }
+                await entry.ready;
+                await fsTruncate(entry.localPath, size);
+                pending.touched(entry);
+            })().then(
+                () => cb(0),
+                (err) => cb(errnoFor(err)),
+            );
         },
 
         release(_path, fd, cb) {
@@ -435,75 +478,63 @@ export function createFuseOperations(
             file.handle
                 .close()
                 .catch(() => {})
-                .then(async () => {
-                    if (!file.isNewFile) {
-                        // Once this fd is closed, getattr()/open() must stop
-                        // answering from this handle's local snapshot (via
-                        // openFilesByPath) and fall back to tree.resolve()
-                        // instead — otherwise a later evict of the local
-                        // cache leaves them stat()ing/reading a file that no
-                        // longer exists on disk. Guarded on identity in case
-                        // another open() already replaced this path's entry.
-                        const rep = openFilesByPath.get(file.path);
-                        if (rep === file) {
-                            openFilesByPath.delete(file.path);
-                        }
-
-                        try {
-                            if (file.dirty) {
-                                await content.uploadRevision(file.node, file.localPath);
-                                tree.invalidate(file.parentUid);
-                            }
-                        } catch (err) {
-                            logger.error(`Failed to upload ${file.name} on release`, err);
-                            cb(errnoFor(err));
-                            return;
-                        }
-                        // A non-cacheable file (outside the allowlist, or
-                        // ephemeral mode) only needs its decrypted copy while
-                        // it is open; drop it now that the last handle closed.
-                        if (file.ephemeral) {
-                            await evictIfUnused(file);
-                        }
-                        cb(0);
-                        return;
+                .then(() => {
+                    // The kernel returned from close() before sending this, so the
+                    // upload never happens here: it waits for the settle window
+                    // (pendingUploads.ts), where a following utimens or rename
+                    // still counts.
+                    if (file.entry && pending.get(file.path) === file.entry) {
+                        pending.closed(file.entry);
                     }
-
-                    const state = newFileStates.get(file.path);
-                    if (!state || state.node.uid !== file.node.uid) {
-                        // Already finalized (or superseded) by another handle.
-                        cb(0);
-                        return;
-                    }
-                    state.refCount = Math.max(0, state.refCount - 1);
-                    if (state.refCount > 0) {
-                        cb(0);
-                        return;
-                    }
-                    if (state.dirty) {
-                        // Real content was written before this close — finalize
-                        // now, and hold the close() acknowledgement until it's
-                        // actually resolvable on Drive. A writer that renames
-                        // this path right after closing it (e.g. a browser's
-                        // .crdownload -> final-name rename) must not race ahead
-                        // of the upload finishing.
-                        await finalizeNewFile(file.path, state);
-                        cb(0);
-                    } else {
-                        // Still empty: either a genuine `touch`, or a writer
-                        // that's about to reopen this same path to write the
-                        // real content (document portal / Chromium download
-                        // idiom). The kernel doesn't wait for this callback to
-                        // complete a close() syscall, so ack it right away — a
-                        // reopen needs that to happen — and decide later,
-                        // after a brief grace window, whether to upload it as
-                        // an empty file.
-                        cb(0);
-                        state.finalizeTimer = setTimeout(() => {
-                            finalizeNewFile(file.path, state);
-                        }, NEW_FILE_FINALIZE_GRACE_MS);
-                    }
+                    cb(0);
                 });
+        },
+
+        utimens(path, atime, mtime, cb) {
+            const entry = pending.get(path);
+            if (entry) {
+                (async () => {
+                    await entry.ready;
+                    const local = await fsStat(entry.localPath);
+                    // fuse-native passes milliseconds, whatever its typings say.
+                    const at = Number(atime);
+                    const mt = Number(mtime);
+                    await fsUtimes(
+                        entry.localPath,
+                        isUtimeMarker(at) ? local.atime : new Date(at),
+                        isUtimeMarker(mt) ? local.mtime : new Date(mt),
+                    );
+                    pending.touched(entry);
+                })().then(
+                    () => cb(0),
+                    (err) => cb(errnoFor(err)),
+                );
+                return;
+            }
+            // On Drive already: a claimed time can only change with a new
+            // revision (a folder's only at creation). Accept and ignore, as
+            // an error would fail every `rsync -t` and `cp -p` over files
+            // already uploaded.
+            requireExists(path).then(
+                () => cb(0),
+                (err) => cb(errnoFor(err)),
+            );
+        },
+
+        // Drive has no POSIX modes or owners. Refuse rather than pretend, so
+        // callers see the change did not happen; sync with `rsync -rlt`.
+        chmod(path, _mode, cb) {
+            requireExists(path).then(
+                () => cb(Fuse.EPERM),
+                (err) => cb(errnoFor(err)),
+            );
+        },
+
+        chown(path, _uid, _gid, cb) {
+            requireExists(path).then(
+                () => cb(Fuse.EPERM),
+                (err) => cb(errnoFor(err)),
+            );
         },
 
         mkdir(path, _mode, cb) {
@@ -518,119 +549,155 @@ export function createFuseOperations(
         },
 
         unlink(path, cb) {
-            Promise.all([tree.resolve(path), tree.resolveParent(path)])
-                .then(async ([node, { parent }]) => {
-                    await drain(sdk.trashNodes([node.uid]));
-                    tree.forgetNode(node.uid);
+            (async () => {
+                const entry = pending.get(path);
+                if (entry) {
+                    const { parent } = await tree.resolveParent(path);
+                    await cancelPending(path);
+                    if (entry.kind === 'revision' && entry.nodeUid) {
+                        await trash(entry.nodeUid);
+                    }
                     tree.invalidate(parent.uid);
-                    await content.forget(node.uid);
-                    cb(0);
-                })
-                .catch((err) => cb(errnoFor(err)));
+                    return;
+                }
+                // On Drive only. Detach before the first await: a write in
+                // the meantime would start a revision of the file going away.
+                const detached = detachHandles(path);
+                let trashed = false;
+                let parentUid: string;
+                try {
+                    const { parent } = await tree.resolveParent(path);
+                    parentUid = parent.uid;
+                    await trash((await tree.resolve(path)).uid, () => {
+                        trashed = true;
+                    });
+                } catch (err) {
+                    if (!trashed) {
+                        reattachHandles(detached);
+                    }
+                    throw err;
+                }
+                // Belt and braces: a write already past its detached check.
+                if (pending.get(path)) {
+                    await cancelPending(path);
+                }
+                tree.invalidate(parentUid);
+            })().then(
+                () => cb(0),
+                (err) => cb(errnoFor(err)),
+            );
         },
 
         rmdir(path, cb) {
-            Promise.all([tree.resolve(path), tree.resolveParent(path)])
-                .then(async ([node, { parent }]) => {
-                    await drain(sdk.trashNodes([node.uid]));
-                    tree.forgetNode(node.uid);
-                    tree.invalidate(parent.uid);
-                    cb(0);
-                })
-                .catch((err) => cb(errnoFor(err)));
+            (async () => {
+                const [node, { parent }] = await Promise.all([tree.resolve(path), tree.resolveParent(path)]);
+                // Drive trashes a folder together with everything in it; rmdir
+                // must only ever remove an empty one.
+                if (await hasChildren(node.uid)) {
+                    throw errnoError('ENOTEMPTY', `${path} is not empty`);
+                }
+                await drain(sdk.trashNodes([node.uid]));
+                tree.forgetNode(node.uid);
+                tree.invalidate(parent.uid);
+            })().then(
+                () => cb(0),
+                (err) => cb(errnoFor(err)),
+            );
         },
 
         rename(src, dest, cb) {
             (async () => {
-                // If dest is a pending, not-yet-uploaded placeholder (e.g. a
-                // downloader pre-creating the final filename before writing
-                // the real content to a separate temp name), it's about to
-                // be superseded — drop it rather than let it upload later as
-                // an orphan empty file.
-                const destPending = newFileStates.get(dest);
-                if (destPending) {
-                    if (destPending.finalizeTimer) {
-                        clearTimeout(destPending.finalizeTimer);
-                    }
-                    newFileStates.delete(dest);
-                    await content.forget(destPending.node.uid).catch(() => {});
-                }
+                const destCtx = await tree.resolveParent(dest);
+                const srcEntry = pending.get(src);
+                const destEntry = pending.get(dest);
 
-                // If src is itself a pending, not-yet-uploaded placeholder,
-                // there's no Drive node yet for tree.resolve(src) to find —
-                // GLib's g_file_replace_contents (gedit/GNOME Text Editor's
-                // save path) issues RENAME while its temp file's write
-                // handle is still open, well before the eventual close()
-                // that would otherwise finalize and upload it. Re-target the
-                // in-flight state onto `dest` instead of resolving; the
-                // eventual close uploads it under the new name/location.
-                const srcPending = newFileStates.get(src);
-                if (srcPending) {
-                    const destCtx = await tree.resolveParent(dest);
-                    const existingDest = await tree.resolve(dest).catch(() => undefined);
-                    if (existingDest) {
-                        await drain(sdk.trashNodes([existingDest.uid]));
-                        tree.forgetNode(existingDest.uid);
+                if (srcEntry?.kind === 'new') {
+                    // Not on Drive yet: rsync's temp file, a download's .part
+                    // file, or GLib's g_file_replace_contents save (which
+                    // renames while its write handle is still open). The
+                    // rename stays local; the upload goes out under the final
+                    // name.
+                    const existing = destEntry ? undefined : await resolveIfExists(dest);
+                    if (destEntry || existing) {
+                        await checkReplaceable(false, dest, existing);
                     }
-
-                    newFileStates.delete(src);
-                    srcPending.parentUid = destCtx.parent.uid;
-                    srcPending.name = destCtx.name;
-                    newFileStates.set(dest, srcPending);
-
-                    const openRep = openFilesByPath.get(src);
-                    if (openRep) {
-                        openFilesByPath.delete(src);
-                        openFilesByPath.set(dest, openRep);
-                    }
-                    for (const file of openFiles.values()) {
-                        if (file.path === src) {
-                            file.path = dest;
-                            file.parentUid = destCtx.parent.uid;
-                            file.name = destCtx.name;
+                    let revisionOf: { nodeUid: string; baseRevisionUid?: string } | undefined;
+                    const detached = detachHandles(dest);
+                    try {
+                        if (destEntry) {
+                            if (destEntry.kind === 'revision' && destEntry.nodeUid) {
+                                revisionOf = { nodeUid: destEntry.nodeUid, baseRevisionUid: destEntry.baseRevisionUid };
+                            }
+                            await cancelPending(dest);
+                        } else if (existing) {
+                            // Replacing a file already on Drive: upload a new
+                            // revision of it, keeping its history, rather than
+                            // trashing it and starting over.
+                            revisionOf = { nodeUid: existing.uid, baseRevisionUid: existing.activeRevision?.uid };
+                            await content.forget(existing.uid);
                         }
+                        pending.move(src, dest, destCtx.parent.uid, destCtx.name, revisionOf);
+                        retargetHandles(src, dest, destCtx.parent.uid, destCtx.name);
+                    } catch (err) {
+                        // Nothing on Drive changed: the destination's file
+                        // stays (a cancelled pending one is ignored by its
+                        // handles anyway).
+                        reattachHandles(detached);
+                        throw err;
                     }
-
-                    tree.invalidate(destCtx.parent.uid);
                     return;
                 }
 
-                const [node, srcCtx, destCtx] = await Promise.all([
-                    tree.resolve(src),
-                    tree.resolveParent(src),
-                    tree.resolveParent(dest),
-                ]);
-
-                // POSIX rename() atomically replaces an existing destination.
-                // If a different, already-uploaded node currently sits at
-                // dest (e.g. that same placeholder, already finalized by the
-                // time this rename arrived), trash it so we don't end up
-                // with two nodes sharing the same name.
-                const existingDest = await tree.resolve(dest).catch(() => undefined);
-                if (existingDest && existingDest.uid !== node.uid) {
-                    await drain(sdk.trashNodes([existingDest.uid]));
-                    tree.forgetNode(existingDest.uid);
+                const [node, srcCtx] = await Promise.all([tree.resolve(src), tree.resolveParent(src)]);
+                // POSIX rename() atomically replaces an existing destination. A
+                // pending one is a file; its Drive node, if any, is the file it revises.
+                const found = await resolveIfExists(dest);
+                const existingDest = found && found.uid !== node.uid ? found : undefined;
+                if (destEntry || existingDest) {
+                    await checkReplaceable(node.type === NodeType.Folder, dest, existingDest);
                 }
-
-                if (srcCtx.parent.uid !== destCtx.parent.uid) {
-                    await drain(sdk.moveNodes([node.uid], destCtx.parent.uid));
+                const detached = detachHandles(dest);
+                let destTrashed = false;
+                try {
+                    if (destEntry) {
+                        await cancelPending(dest);
+                    }
+                    if (existingDest) {
+                        await trash(existingDest.uid, () => {
+                            destTrashed = true;
+                        });
+                    }
+                    if (srcCtx.parent.uid !== destCtx.parent.uid) {
+                        await drain(sdk.moveNodes([node.uid], destCtx.parent.uid));
+                    }
+                    if (srcCtx.name !== destCtx.name) {
+                        await sdk.renameNode(node.uid, destCtx.name);
+                    }
+                    tree.invalidate(srcCtx.parent.uid, destCtx.parent.uid);
+                    if (srcEntry) {
+                        pending.move(src, dest, destCtx.parent.uid, destCtx.name); // the revision follows its node
+                    }
+                    if (node.type === NodeType.Folder) {
+                        pending.moveFolder(src, dest);
+                    }
+                    retargetHandles(src, dest, destCtx.parent.uid, destCtx.name);
+                } catch (err) {
+                    // The destination's file stays, unless Drive trashed it
+                    // already (a cancelled pending one is ignored by its
+                    // handles anyway).
+                    if (!destTrashed) {
+                        reattachHandles(detached);
+                    }
+                    throw err;
                 }
-                if (srcCtx.name !== destCtx.name) {
-                    await sdk.renameNode(node.uid, destCtx.name);
-                }
-                tree.invalidate(srcCtx.parent.uid, destCtx.parent.uid);
-            })()
-                .then(() => cb(0))
-                .catch((err) => cb(errnoFor(err)));
+            })().then(
+                () => cb(0),
+                (err) => cb(errnoFor(err)),
+            );
         },
     };
 
-    function hasUnsavedChanges(path: string): boolean {
-        const file = openFilesByPath.get(path);
-        return !!file && (file.dirty || file.isNewFile);
-    }
-
-    return { ops, hasUnsavedChanges };
+    return { ops, hasUnsavedChanges: (path) => pending.has(path) };
 }
 
 async function drain(iterable: AsyncIterable<unknown>): Promise<void> {
@@ -639,9 +706,17 @@ async function drain(iterable: AsyncIterable<unknown>): Promise<void> {
     }
 }
 
+/** A local error that errnoFor() maps to errno `code`. */
+function errnoError(code: string, message: string): Error {
+    return Object.assign(new Error(message), { code });
+}
+
 function errnoFor(err: unknown): number {
     if (err instanceof NodeNotFoundError) {
         return Fuse.ENOENT;
     }
-    return Fuse.EIO;
+    // Local errors (ENOENT, ENOTEMPTY, EEXIST, ...) keep their meaning.
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    const value = typeof code === 'string' ? (Fuse as unknown as Record<string, unknown>)[code] : undefined;
+    return typeof value === 'number' ? value : Fuse.EIO;
 }

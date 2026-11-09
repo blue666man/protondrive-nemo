@@ -69,6 +69,22 @@ bundling them with esbuild (`test/run.js`). The FUSE binding is replaced by
 an in-memory stand-in (`test/stubs/fuse-native.ts`), so the tests need
 neither `/dev/fuse` nor any native module to be built.
 
+```bash
+npm rebuild @cocalc/fuse-native   # once: builds the native FUSE binding
+npm run test:mount
+```
+
+Mounts the filesystem for real, backed by an in-memory Drive
+(`test/fakeDrive.ts`), and drives it with `rsync`, `cp`, `touch` and `mv`. It
+checks that every file is uploaded once, under its final name, with its own
+modification time. It needs `/dev/fuse`, a setuid `fusermount`, and the native
+binding built with the fix for
+[fuse-native#3](https://github.com/sagemathinc/fuse-native/issues/3). Until a
+fixed release exists: in `node_modules/@cocalc/fuse-native/fuse-native.c`,
+change `l->atime` to `l->mtime` in the second `FUSE_UINT64_TO_INTS_ARGV` of
+the `utimens` method, delete its `build/` directory, then run
+`npm rebuild @cocalc/fuse-native`.
+
 ## Usage
 
 ```bash
@@ -81,6 +97,16 @@ In another terminal (or Ctrl+C the `mount` process to unmount):
 ```bash
 node dist/cli.js unmount
 ```
+
+`unmount` asks the running mount daemon to shut down over its control
+socket: uploads still running get the shutdown grace period (see below), the
+rest stay pending and upload on the next `mount`. If no daemon answers (it
+crashed or was killed), `unmount` just detaches the mount it left behind.
+
+Only one mount daemon runs per account: a second `mount` for the same
+account refuses to start (`already running for this account (pid N)`), as
+the two would share one pending-upload journal. The lock is `daemon.lock` in
+the account's cache dir; a lock left by a process that is gone is taken over.
 
 Other commands: `node dist/cli.js status`, `node dist/cli.js logout`.
 
@@ -249,6 +275,46 @@ PROTONDRIVE_NEMO_EPHEMERAL_CACHE=1 node dist/cli.js mount
 
 The SDK's metadata cache is unaffected: it is encrypted at rest.
 
+## Timestamps, pending uploads and syncing
+
+Files keep their own modification time: copying onto the mount with
+`cp -p`, `touch -d` or `rsync -t` stores that time with the upload (Proton's
+apps show it too), and the mount reports it back.
+
+A changed file is not uploaded the moment it is closed. It waits until it has
+been quiet for 2 seconds (`PROTONDRIVE_NEMO_SETTLE_MS`), so that the
+`utimensat` and `rename` that tools like rsync issue right after closing are
+part of the same upload, and a file saved over an existing one becomes a new
+revision of it (its history is kept). Until then it lives in `pending/` in the
+cache dir with a journal record, and survives an unmount, a crash or a
+reboot: the next `mount` uploads it. On shutdown the mount gives running
+uploads 10 seconds (`PROTONDRIVE_NEMO_SHUTDOWN_GRACE_MS`) and leaves the rest
+for next time.
+
+- `protondrive-nemo flush` uploads everything pending now and waits; it exits
+  non-zero if anything is still not on Drive.
+- `protondrive-nemo status` shows pending and failed uploads.
+- If a file changed on Drive since you changed it here, or a file with the
+  same name appeared, your version is kept beside it as
+  `name (conflict YYYY-MM-DD HHMM).ext`. Nothing is overwritten silently.
+
+Drive has no permissions or owners, so `chmod` and `chown` fail with
+"Operation not permitted". Sync with
+
+```bash
+rsync -rlt SRC/ ~/ProtonDrive/DEST/
+```
+
+(or `rsync -a --no-perms --no-owner --no-group`). Plain `rsync -a` copies
+nothing: rsync gives up on each file when it cannot set its permissions, and
+exits with code 23. Setting the time of a file that is already
+uploaded (e.g. `touch -d` on it) succeeds but has no effect: Drive can only
+store a new time together with new content.
+
+Keeping modification times needs `@cocalc/fuse-native` with the fix for
+[issue #3](https://github.com/sagemathinc/fuse-native/issues/3); see
+[Tests](#tests).
+
 ## Architecture
 
 ```
@@ -256,11 +322,15 @@ src/cli.ts              commander CLI: login, logout, status, mount, unmount
 src/mount.ts             wires DriveTree + ContentStore + FUSE ops into a Fuse instance
 src/fuseOps.ts            FUSE syscall handlers (getattr, readdir, read, write, ...)
 src/driveTree.ts          FUSE path <-> Drive node UID resolution + short-lived directory-listing cache
-src/contentStore.ts        local blob cache: download-on-open, upload-on-release
+src/contentStore.ts        local blob cache: download-on-open
 src/cachePolicy.ts         decides which paths may stay in the local cache (allowlist / ephemeral)
-src/ipcServer.ts            Unix-socket control channel for the `evict` CLI command
-                            and the cache-status Nemo extension to talk to the
-                            running mount daemon
+src/pendingUploads.ts      changes not on Drive yet: settle window, conflicts, retries, shutdown
+src/pendingJournal.ts      durable per-upload records beside their content (pending/)
+src/ipcServer.ts            Unix-socket control channel to the running mount daemon:
+                            `evict`, the cache-status Nemo extension (`cacheStatus`),
+                            and `flush`, `pendingStatus` (`status`) and `shutdown` (`unmount`)
+src/shutdown.ts             the daemon's one guarded shutdown (signals and `unmount`)
+src/instanceLock.ts         one mount daemon per account (`daemon.lock`)
 nemo-extension/             nemo-python extension: cache-status emblem + list-view
                             column (see install-nemo-cache-emblems.sh)
 src/sdk-bootstrap/         bootstraps @protontech/drive-sdk's ProtonDriveClient:
@@ -274,7 +344,8 @@ src/types/stubs/           tsc-only type stand-ins for @protontech/crypto — se
 
 Content model: opening a file downloads it in full to a local cache
 (`$XDG_CACHE_HOME/protondrive-nemo/blobs/`, decrypted) before any byte is
-readable, and a dirty file is re-uploaded as a new revision on close. This
+readable, and a changed file is uploaded as a new revision once it has settled (see
+[Timestamps, pending uploads and syncing](#timestamps-pending-uploads-and-syncing)). This
 is simple and reliable but means very large files are slower to open than a
 true byte-range/streaming implementation would be — a reasonable v1
 tradeoff given Proton's own SDK doesn't yet ship a sync module to build a
@@ -296,8 +367,8 @@ immediately, so your own changes always show up right away.
 
 - Only "My Files" is exposed — no Trash, Devices, Shared-with-me, or Photos.
 - No true streaming: large file opens download the whole file first.
-- No conflict handling beyond what the SDK itself does — this isn't a
-  background sync engine, just a live view.
+- Conflicts are detected only for files changed through this mount (they
+  become conflict copies); it isn't a background sync engine, just a live view.
 - No Nemo-specific extras yet (sync-status emblems, "copy share link" in the
   right-click menu). Since this is a real mount, basic file operations don't
   need them; they're a natural follow-up built on the SDK's sharing API.

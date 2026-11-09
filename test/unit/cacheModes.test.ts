@@ -10,6 +10,7 @@ import { ContentStore } from '../../src/contentStore';
 import { DriveTree, NodeNotFoundError } from '../../src/driveTree';
 import { createFuseOperations } from '../../src/fuseOps';
 import { mount } from '../../src/mount';
+import type { PendingUploads } from '../../src/pendingUploads';
 import { getConfig } from '../../src/sdk-bootstrap/config';
 import Fuse from '../stubs/fuse-native';
 import { callOp, downloadingSdk, fakeDrive, fileNode, silentLogger, tempDir } from '../helpers';
@@ -51,7 +52,7 @@ function setup(cachePaths: string[], ephemeralCache = false) {
     const files = { '/Docs/a.txt': fileNode('node-a', 5), '/Other/b.txt': fileNode('node-b', 5) };
     const content = new ContentStore(downloadingSdk('hello'), tmp.dir, silentLogger);
     const policy = createCachePolicy({ cachePaths, ephemeralCache });
-    const { ops } = createFuseOperations(downloadingSdk('hello'), fakeTree(files), content, policy, silentLogger);
+    const { ops } = createFuseOperations(downloadingSdk('hello'), fakeTree(files), content, policy, {} as PendingUploads, silentLogger);
     const blob = (dir: 'blobs' | 'tmp', uid: string) => path.join(tmp.dir, dir, encodeURIComponent(uid));
     return { ops, blob };
 }

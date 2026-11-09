@@ -1,4 +1,4 @@
-import { createServer, type Server, type Socket } from 'node:net';
+import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { unlink } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -7,8 +7,7 @@ import type { Logger, NodeEntity } from '@protontech/drive-sdk';
 
 import type { ContentStore } from './contentStore';
 import { DriveTree, NodeNotFoundError } from './driveTree';
-
-type Request = { op: 'evict'; path: string } | { op: 'cacheStatus'; path: string };
+import type { FlushResult, PendingStatus, PendingUploads } from './pendingUploads';
 
 interface EvictResponse {
     ok: boolean;
@@ -22,6 +21,34 @@ interface CacheStatusResponse {
     error?: string;
     entries?: Record<string, CacheState>;
 }
+
+export type IpcRequest =
+    | { op: 'evict'; path: string }
+    | { op: 'cacheStatus'; path: string }
+    | { op: 'pendingStatus' }
+    | { op: 'flush' }
+    | { op: 'shutdown' };
+
+interface PendingStatusResponse {
+    ok: boolean;
+    error?: string;
+    status?: PendingStatus;
+}
+
+interface FlushResponse {
+    ok: boolean;
+    error?: string;
+    result?: FlushResult;
+}
+
+interface ShutdownResponse {
+    ok: boolean;
+    error?: string;
+    /** Uploads left in the journal for the next mount. */
+    remaining?: number;
+}
+
+type Response = EvictResponse | CacheStatusResponse | PendingStatusResponse | FlushResponse | ShutdownResponse;
 
 /**
  * Wall-clock budget for a single cacheStatus request, covering every
@@ -43,6 +70,38 @@ export function socketPathFor(cacheDir: string): string {
 }
 
 /**
+ * Sends one request to the mount daemon listening on `socketPath` and
+ * resolves with its answer. Rejects with `mount-not-running` when nothing
+ * listens there.
+ */
+export function sendRequest<T = unknown>(socketPath: string, request: IpcRequest): Promise<T> {
+    return new Promise((resolve, reject) => {
+        const socket = createConnection(socketPath);
+        let buffer = '';
+        socket.on('connect', () => {
+            socket.write(`${JSON.stringify(request)}\n`);
+        });
+        socket.on('data', (chunk) => {
+            buffer += chunk.toString('utf8');
+            const newlineIndex = buffer.indexOf('\n');
+            if (newlineIndex >= 0) {
+                socket.end();
+                try {
+                    resolve(JSON.parse(buffer.slice(0, newlineIndex)) as T);
+                } catch (err) {
+                    reject(err);
+                }
+            }
+        });
+        socket.on('error', (err: NodeJS.ErrnoException) => {
+            reject(new Error(err.code === 'ENOENT' || err.code === 'ECONNREFUSED' ? 'mount-not-running' : err.message));
+        });
+        // The daemon went away without answering (no-op once resolved).
+        socket.on('close', () => reject(new Error('no-answer')));
+    });
+}
+
+/**
  * Small Unix-socket control channel so a one-shot CLI invocation (bound to a
  * Nemo right-click action) can ask the long-running mount daemon to evict a
  * single file's local cache entry — without duplicating the daemon's SDK
@@ -51,6 +110,14 @@ export function socketPathFor(cacheDir: string): string {
  */
 export class IpcServer {
     private server?: Server;
+    /** Open client connections; stop() ends them, so a silent client can't hold it up. */
+    private readonly sockets = new Set<Socket>();
+
+    /**
+     * Answers `{ op: 'shutdown' }`: shuts the daemon down and resolves with
+     * the number of uploads left for the next mount. Set by the CLI.
+     */
+    onShutdown?: () => Promise<number>;
 
     constructor(
         private readonly socketPath: string,
@@ -58,6 +125,7 @@ export class IpcServer {
         private readonly content: ContentStore,
         private readonly hasUnsavedChanges: (path: string) => boolean,
         private readonly logger: Logger,
+        private readonly pending: Pick<PendingUploads, 'status' | 'flush'>,
     ) {}
 
     async start(): Promise<void> {
@@ -73,12 +141,19 @@ export class IpcServer {
     async stop(): Promise<void> {
         const server = this.server;
         if (server) {
-            await new Promise<void>((resolve) => server.close(() => resolve()));
+            const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+            for (const socket of this.sockets) {
+                socket.destroy();
+            }
+            this.sockets.clear();
+            await closed;
         }
         await unlink(this.socketPath).catch(() => {});
     }
 
     private handleConnection(socket: Socket): void {
+        this.sockets.add(socket);
+        socket.on('close', () => this.sockets.delete(socket));
         let buffer = '';
         socket.on('data', (chunk) => {
             buffer += chunk.toString('utf8');
@@ -96,23 +171,49 @@ export class IpcServer {
         if (!line.trim()) {
             return;
         }
-        this.handleRequest(line)
-            .catch((err): EvictResponse | CacheStatusResponse => ({
+        let req: IpcRequest | undefined;
+        Promise.resolve()
+            .then(() => {
+                req = JSON.parse(line) as IpcRequest;
+                if (req.op === 'shutdown') {
+                    // The shutdown stops the server, perhaps before it
+                    // answers: keep this client out of stop()'s reach, so
+                    // its answer (ok or not) always arrives.
+                    this.sockets.delete(socket);
+                }
+                return this.handleRequest(req);
+            })
+            .catch((err): Response => ({
                 ok: false,
                 error: err instanceof NodeNotFoundError ? 'not-found' : err instanceof Error ? err.message : String(err),
             }))
             .then((res) => {
+                if (req?.op === 'shutdown') {
+                    socket.end(`${JSON.stringify(res)}\n`);
+                    return;
+                }
                 socket.write(`${JSON.stringify(res)}\n`);
             });
     }
 
-    private async handleRequest(line: string): Promise<EvictResponse | CacheStatusResponse> {
-        const req = JSON.parse(line) as Request;
+    private async handleRequest(req: IpcRequest): Promise<Response> {
         if (req.op === 'evict') {
             return this.handleEvict(req.path);
         }
         if (req.op === 'cacheStatus') {
             return this.handleCacheStatus(req.path);
+        }
+        if (req.op === 'pendingStatus') {
+            return { ok: true, status: this.pending.status() };
+        }
+        if (req.op === 'flush') {
+            return { ok: true, result: await this.pending.flush() };
+        }
+        if (req.op === 'shutdown') {
+            if (!this.onShutdown) {
+                return { ok: false, error: 'shutdown-unsupported' };
+            }
+            return { ok: true, remaining: await this.onShutdown() };
         }
         throw new Error(`Unknown op: ${(req as { op: string }).op}`);
     }
