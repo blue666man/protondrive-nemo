@@ -112,9 +112,9 @@ program
         // is up. A second one before then quits at once, for a mount that
         // hangs. That is safe: the lock left behind names this process,
         // which is gone, so the next start takes it over; and the next
-        // mount's fuse-native mount (force: true) clears a half-up mount
-        // left on the mount point. (Not unit-tested: this file runs
-        // commander at import.)
+        // mount clears a dead mount left on the mount point
+        // (test/mount/staleMount.test.ts). (The handlers are not
+        // unit-tested: this file runs commander at import.)
         let shutdown: ((reason: string) => ShutdownRun) | undefined;
         let earlySignal: string | undefined;
         const onSignal = (signal: string) => {
