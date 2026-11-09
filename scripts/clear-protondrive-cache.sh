@@ -4,11 +4,9 @@
 # decrypts a file again on its next open (see contentStore.ts). Bound to a
 # Nemo right-click action by install-nemo-clear-cache-action.sh.
 #
-# Caution: if a file under the mount is currently open in an app and dirty
-# (unsaved changes), clearing the cache out from under it will make that
-# file's upload-on-close fail, since the upload re-reads the local cache
-# path from disk rather than the already-open handle. Only safe to run when
-# nothing on the mount is actively being edited.
+# Safe while files are open or have unsaved changes: changes waiting to
+# upload live in pending/, which this never touches, and open handles keep
+# their own file descriptor. Only blobs/ (the read cache) is emptied.
 set -euo pipefail
 
 MOUNT_POINT="${PROTONDRIVE_NEMO_MOUNT_POINT:-$HOME/ProtonDrive}"

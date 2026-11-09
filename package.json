@@ -11,7 +11,9 @@
   "scripts": {
     "build": "node esbuild.config.js",
     "typecheck": "tsc -p tsconfig.typecheck.json",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "test": "node test/run.js",
+    "test:mount": "node test/run.js mount"
   },
   "dependencies": {
     "@cocalc/fuse-native": "^2.4.3",
@@ -20,7 +22,6 @@
     "@protontech/global-types": "^1.1.0",
     "better-sqlite3": "^11.3.0",
     "commander": "^12.1.0",
-    "keytar": "^7.9.0",
     "ky": "^1.14.3",
     "open": "^10.1.0",
     "proton-drive-sdk-account": "file:vendor/proton-drive-sdk-account"

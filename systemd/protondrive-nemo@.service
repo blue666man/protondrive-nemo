@@ -1,3 +1,8 @@
+# Not supported: the stored session is
+# GPG-encrypted, so start the mount by hand (`protondrive-nemo mount`) after
+# gpg-agent is unlocked. This unit sets no PROTONDRIVE_NEMO_GPG_RECIPIENT,
+# starts at login before the agent is unlocked and runs dist/cli.js through
+# nvm, not the Nix package; it predates the GPG session store.
 [Unit]
 Description=Proton Drive FUSE mount (unofficial) — account %i
 Documentation=https://github.com/ProtonDriveApps/sdk
@@ -10,7 +15,7 @@ Type=simple
 # than relying on a plain `node` on PATH. %i is the instance name after the
 # `@` (e.g. `work` for protondrive-nemo@work.service), passed straight
 # through as --account; the CLI validates it against [A-Za-z0-9_-]+ before
-# using it in any path or keychain lookup.
+# using it in any path or credentials-file lookup.
 ExecStart=/bin/bash -c 'source %h/.nvm/nvm.sh && node %h/protondrive-nemo/dist/cli.js mount --account %i'
 ExecStop=/bin/bash -c 'source %h/.nvm/nvm.sh && node %h/protondrive-nemo/dist/cli.js unmount --account %i'
 Restart=on-failure

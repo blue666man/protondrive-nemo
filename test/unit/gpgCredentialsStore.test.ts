@@ -1,0 +1,267 @@
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { after, before, test } from 'node:test';
+
+import { ValidationError } from '@protontech/drive-sdk';
+
+import { getConfig } from '../../src/sdk-bootstrap/config';
+import { initCredentials } from '../../src/sdk-bootstrap/credentials';
+import { GpgCredentialsStore } from '../../src/sdk-bootstrap/credentials/gpgCredentialsStore';
+import type { Credentials } from '../../src/sdk-bootstrap/credentials/interface';
+import { silentLogger } from '../helpers';
+
+// A throwaway keyring: never the user's ~/.gnupg. Short path: gpg-agent's
+// socket path must fit in sun_path.
+const home = mkdtempSync(path.join(tmpdir(), 'pdg-'));
+const files = mkdtempSync(path.join(tmpdir(), 'pdg-files-'));
+const savedHome = process.env.GNUPGHOME;
+const RECIPIENT = 'protondrive-nemo-test@example.invalid';
+
+// The shape parseStoredSnapshot() returns, so a round trip deep-equals it.
+const snapshot: Credentials = {
+    cachePassword: 'cache-pw-4f1d9a',
+    userKeyPassword: 'user-key-pw-8c2e71',
+    session: {
+        uid: 'session-uid-a93b0c',
+        accessToken: 'access-token-5d7e22',
+        refreshToken: 'refresh-token-e61f48',
+    },
+    telemetryEnabled: false,
+};
+
+let counter = 0;
+function credentialsFile(): string {
+    counter += 1;
+    return path.join(files, `nested-${counter}`, 'auth-session.gpg');
+}
+
+before(() => {
+    process.env.GNUPGHOME = home;
+    // Verified 2026-11-05: `future-default default` gives ed25519 + a cv25519
+    // encryption subkey. (`ed25519 cert,encr` makes no encryption key, and gpg
+    // then tries a WKD *network* lookup for the recipient: never do that.)
+    execFileSync(
+        'gpg',
+        ['--batch', '--pinentry-mode', 'loopback', '--passphrase', '', '--quick-gen-key', RECIPIENT, 'future-default', 'default', 'never'],
+        { stdio: 'ignore' },
+    );
+});
+
+after(() => {
+    try {
+        execFileSync('gpgconf', ['--kill', 'all'], { stdio: 'ignore' });
+    } finally {
+        if (savedHome === undefined) delete process.env.GNUPGHOME;
+        else process.env.GNUPGHOME = savedHome;
+        rmSync(home, { recursive: true, force: true });
+        rmSync(files, { recursive: true, force: true });
+    }
+});
+
+test('save() then load() round-trips the snapshot', async () => {
+    const store = new GpgCredentialsStore(credentialsFile(), RECIPIENT, silentLogger);
+    await store.save(snapshot);
+    assert.deepEqual(await store.load(), snapshot);
+});
+
+test('only ASCII-armoured ciphertext, mode 0600, is written to disk', async () => {
+    const file = credentialsFile();
+    const store = new GpgCredentialsStore(file, RECIPIENT, silentLogger);
+    await store.save(snapshot);
+    const onDisk = readFileSync(file, 'utf8');
+    assert.ok(onDisk.startsWith('-----BEGIN PGP MESSAGE-----'), onDisk.slice(0, 40));
+    for (const value of [
+        snapshot.cachePassword!,
+        snapshot.userKeyPassword,
+        snapshot.session.uid,
+        snapshot.session.accessToken,
+        snapshot.session.refreshToken!,
+    ]) {
+        assert.ok(!onDisk.includes(value), `ciphertext contains ${value}`);
+    }
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+});
+
+test('save() over an existing 0644 file replaces it atomically: mode 0600, no temp file left', async () => {
+    const file = credentialsFile();
+    const store = new GpgCredentialsStore(file, RECIPIENT, silentLogger);
+    await store.save(snapshot);
+    chmodSync(file, 0o644);
+    await store.save({ ...snapshot, userKeyPassword: 'user-key-pw-rotated' });
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+    assert.deepEqual(readdirSync(path.dirname(file)), ['auth-session.gpg']);
+    assert.deepEqual(await store.load(), { ...snapshot, userKeyPassword: 'user-key-pw-rotated' });
+});
+
+test('a failed save() leaves the previous file intact and no temp file behind', async () => {
+    const file = credentialsFile();
+    await new GpgCredentialsStore(file, RECIPIENT, silentLogger).save(snapshot);
+    const before = readFileSync(file);
+    // A target that is a non-empty directory makes the final rename fail.
+    const blocked = path.join(path.dirname(file), 'blocked');
+    mkdirSync(path.join(blocked, 'inside'), { recursive: true });
+    const store = new GpgCredentialsStore(blocked, RECIPIENT, silentLogger);
+    await assert.rejects(store.save(snapshot));
+    assert.deepEqual(readdirSync(path.dirname(file)).sort(), ['auth-session.gpg', 'blocked']);
+    assert.deepEqual(readFileSync(file), before);
+});
+
+test('two concurrent save() calls leave exactly one of the two snapshots intact', async () => {
+    const a: Credentials = { ...snapshot, userKeyPassword: 'user-key-pw-concurrent-a' };
+    const b: Credentials = { ...snapshot, userKeyPassword: 'user-key-pw-concurrent-b' };
+    for (let round = 0; round < 5; round += 1) {
+        const file = credentialsFile();
+        const store = new GpgCredentialsStore(file, RECIPIENT, silentLogger);
+        const results = await Promise.allSettled([store.save(a), store.save(b)]);
+        assert.ok(results.some((r) => r.status === 'fulfilled'), JSON.stringify(results));
+        const loaded = await store.load();
+        assert.ok(
+            [a.userKeyPassword, b.userKeyPassword].includes(loaded?.userKeyPassword ?? ''),
+            String(loaded?.userKeyPassword),
+        );
+        assert.deepEqual(loaded, loaded?.userKeyPassword === a.userKeyPassword ? a : b);
+        assert.deepEqual(readdirSync(path.dirname(file)), ['auth-session.gpg']);
+    }
+});
+
+test('concurrent writes of the file never tear it (the write step, raced directly)', async () => {
+    // gpg's run time spreads real save() calls apart; racing the write step
+    // itself forces the interleaving a shared temp name cannot survive.
+    const file = credentialsFile();
+    const store = new GpgCredentialsStore(file, RECIPIENT, silentLogger);
+    const write = (data: Buffer): Promise<void> =>
+        (store as unknown as { writeAtomically(data: Buffer): Promise<void> }).writeAtomically(data);
+    const a = Buffer.alloc(4 << 20, 'a');
+    const b = Buffer.alloc(4 << 20, 'b');
+    const results = await Promise.allSettled([write(a), write(b)]);
+    assert.ok(results.some((r) => r.status === 'fulfilled'), JSON.stringify(results));
+    const onDisk = readFileSync(file);
+    assert.ok(onDisk.equals(a) || onDisk.equals(b), `torn file: ${onDisk.length} bytes`);
+    assert.deepEqual(readdirSync(path.dirname(file)), ['auth-session.gpg']);
+});
+
+test('without gpg on PATH, save() and load() say so', async () => {
+    const file = credentialsFile();
+    const store = new GpgCredentialsStore(file, RECIPIENT, silentLogger);
+    await store.save(snapshot);
+    const emptyBin = mkdtempSync(path.join(tmpdir(), 'pdg-nobin-'));
+    const savedPath = process.env.PATH;
+    const notFound = (error: unknown) => {
+        assert.ok(error instanceof Error, String(error));
+        assert.match(error.message, /gpg not found on PATH \(install GnuPG\)/);
+        return true;
+    };
+    try {
+        process.env.PATH = emptyBin;
+        await assert.rejects(store.save(snapshot), notFound);
+        await assert.rejects(store.load(), notFound);
+    } finally {
+        process.env.PATH = savedPath;
+        rmSync(emptyBin, { recursive: true, force: true });
+    }
+});
+
+test('load() returns null when there is no file', async () => {
+    const store = new GpgCredentialsStore(credentialsFile(), RECIPIENT, silentLogger);
+    assert.equal(await store.load(), null);
+});
+
+test('load() rejects a file that is not PGP with a ValidationError naming it', async () => {
+    const file = path.join(files, 'garbage.gpg');
+    writeFileSync(file, 'not pgp');
+    const store = new GpgCredentialsStore(file, RECIPIENT, silentLogger);
+    await assert.rejects(store.load(), (error: unknown) => {
+        assert.ok(error instanceof ValidationError, String(error));
+        assert.ok(error.message.includes(file), error.message);
+        return true;
+    });
+});
+
+test('remove() deletes the file and is idempotent', async () => {
+    const file = credentialsFile();
+    const store = new GpgCredentialsStore(file, RECIPIENT, silentLogger);
+    await store.save(snapshot);
+    assert.ok(existsSync(file));
+    await store.remove();
+    assert.ok(!existsSync(file));
+    await store.remove();
+});
+
+test('save() to a recipient with no local key rejects without fetching one (no WKD)', async () => {
+    // `.invalid` never resolves, so even the pre-fix WKD lookup reached no third party.
+    const file = credentialsFile();
+    const store = new GpgCredentialsStore(file, 'nobody@example.invalid', silentLogger);
+    await assert.rejects(store.save(snapshot), (error: unknown) => {
+        assert.ok(error instanceof Error, String(error));
+        assert.ok(!/WKD/i.test(error.message), error.message);
+        return true;
+    });
+    assert.ok(!existsSync(file));
+});
+
+test('a gpg.conf that enables WKD cannot re-enable the network lookup', async () => {
+    // `--auto-key-locate` mechanisms accumulate after gpg.conf's unless cleared.
+    const conf = path.join(home, 'gpg.conf');
+    writeFileSync(conf, 'auto-key-locate local,wkd\nauto-key-retrieve\n');
+    try {
+        const store = new GpgCredentialsStore(credentialsFile(), 'nobody@example.invalid', silentLogger);
+        await assert.rejects(store.save(snapshot), (error: unknown) => {
+            assert.ok(error instanceof Error, String(error));
+            assert.ok(!/WKD/i.test(error.message), error.message);
+            return true;
+        });
+    } finally {
+        rmSync(conf, { force: true });
+    }
+});
+
+const ENV = ['PROTONDRIVE_NEMO_GPG_RECIPIENT', 'PROTONDRIVE_NEMO_CREDENTIALS_FILE'] as const;
+
+function withEnv(values: Partial<Record<(typeof ENV)[number], string>>, fn: () => void): void {
+    const saved = ENV.map((name) => [name, process.env[name]] as const);
+    try {
+        for (const name of ENV) delete process.env[name];
+        Object.assign(process.env, values);
+        fn();
+    } finally {
+        for (const [name, value] of saved) {
+            if (value === undefined) delete process.env[name];
+            else process.env[name] = value;
+        }
+    }
+}
+
+const configOptions = { appVersion: 'test', clientUidPrefix: 'test' };
+
+test('initCredentials() without a GPG recipient throws a ValidationError naming the env var', () => {
+    withEnv({}, () => {
+        const config = { ...getConfig(configOptions), gpgRecipient: undefined };
+        assert.throws(
+            () => initCredentials(config, silentLogger),
+            (error: unknown) => {
+                assert.ok(error instanceof ValidationError, String(error));
+                assert.ok(error.message.includes('PROTONDRIVE_NEMO_GPG_RECIPIENT'), error.message);
+                return true;
+            },
+        );
+    });
+});
+
+test('getConfig() reads the GPG recipient and credentials file from the environment', () => {
+    withEnv({}, () => {
+        const config = getConfig(configOptions);
+        assert.equal(config.gpgRecipient, undefined);
+        assert.equal(config.credentialsFile, path.join(config.appDir, 'auth-session.gpg'));
+    });
+    withEnv(
+        { PROTONDRIVE_NEMO_GPG_RECIPIENT: RECIPIENT, PROTONDRIVE_NEMO_CREDENTIALS_FILE: '/tmp/elsewhere/session.gpg' },
+        () => {
+            const config = getConfig(configOptions);
+            assert.equal(config.gpgRecipient, RECIPIENT);
+            assert.equal(config.credentialsFile, '/tmp/elsewhere/session.gpg');
+        },
+    );
+});

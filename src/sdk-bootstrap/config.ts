@@ -10,8 +10,21 @@ export interface InitConfig {
     sdkVersion?: string;
     clientUidPrefix: string;
     enablePersistedEvents?: boolean;
-    /** Account profile, isolating keychain entry, cache/app dirs, and default mount point. Defaults to `'default'`. */
+    /** Account profile, isolating the credentials file, cache/app dirs, and default mount point. Defaults to `'default'`. */
     profile?: string;
+    /**
+     * Remote folder paths whose files may be kept in the persistent local
+     * cache. Overrides `PROTONDRIVE_NEMO_CACHE_PATHS` (comma-separated). Empty
+     * means every file is cacheable, which is the default.
+     */
+    cachePaths?: string[];
+    /**
+     * When true, decrypted file content is never kept on disk: every open is
+     * downloaded to a temporary location and removed again, and the whole
+     * content cache is wiped on start and on exit. Overrides
+     * `PROTONDRIVE_NEMO_EPHEMERAL_CACHE`. Defaults to false.
+     */
+    ephemeralCache?: boolean;
 }
 
 export interface Config {
@@ -39,6 +52,37 @@ export interface Config {
     enablePersistedEvents: boolean;
     /** Level of logging to the console. */
     logLevel: LogLevel;
+
+    /**
+     * GPG key id/fingerprint (set `PROTONDRIVE_NEMO_GPG_RECIPIENT`). The stored
+     * session is encrypted to this key and decrypted in memory through the
+     * user's gpg-agent. Required: there is no keychain or passphrase fallback.
+     */
+    gpgRecipient?: string;
+    /**
+     * Absolute path to the GPG-encrypted credentials file. Only ciphertext is
+     * written here; plaintext credentials never touch disk. Defaults to
+     * `<appDir>/auth-session.gpg`. `PROTONDRIVE_NEMO_CREDENTIALS_FILE`
+     * overrides it for the default profile only; every other `--account`
+     * always uses its own `<appDir>/auth-session.gpg`, so profiles never
+     * share (and overwrite) one session file. Saving renames a new file
+     * into place, so a symlink here is replaced by a regular file on the
+     * next save (its target is left untouched): give the real path.
+     */
+    credentialsFile: string;
+
+    /**
+     * Remote folder paths (POSIX-style, under "My Files") whose files may be
+     * kept in the persistent local cache. Empty = every file may be cached.
+     * Files outside these folders are still readable, but their decrypted copy
+     * is removed as soon as it is closed.
+     */
+    cachePaths: string[];
+    /**
+     * When true, no decrypted content is ever kept: every open uses a
+     * throwaway copy and the content cache is wiped on start and exit.
+     */
+    ephemeralCache: boolean;
 }
 
 /**
@@ -57,6 +101,16 @@ export function getConfig(options: InitConfig): Config {
 
     const baseUrl = process.env.PROTONDRIVE_NEMO_BASE_URL || 'drive-api.proton.me';
 
+    const gpgRecipient = process.env.PROTONDRIVE_NEMO_GPG_RECIPIENT || undefined;
+    // The override names one file, so it can only belong to one profile: the
+    // default. Other profiles keep their own, or `--account work login`
+    // would overwrite the default account's session.
+    const credentialsOverride = profile === 'default' ? process.env.PROTONDRIVE_NEMO_CREDENTIALS_FILE : undefined;
+    const credentialsFile = credentialsOverride || path.join(appDir, 'auth-session.gpg');
+
+    const cachePaths = options.cachePaths ?? parsePathList(process.env.PROTONDRIVE_NEMO_CACHE_PATHS);
+    const ephemeralCache = options.ephemeralCache ?? isTruthy(process.env.PROTONDRIVE_NEMO_EPHEMERAL_CACHE);
+
     return {
         profile,
         clientUidPrefix: options.clientUidPrefix,
@@ -69,7 +123,26 @@ export function getConfig(options: InitConfig): Config {
         appDir,
         enablePersistedEvents: options.enablePersistedEvents ?? true,
         logLevel,
+        gpgRecipient,
+        credentialsFile,
+        cachePaths,
+        ephemeralCache,
     };
+}
+
+/** Parses `PROTONDRIVE_NEMO_CACHE_PATHS`: a comma- or colon-separated list of Drive folder paths. */
+function parsePathList(raw: string | undefined): string[] {
+    if (!raw) {
+        return [];
+    }
+    return raw
+        .split(/[,:]/)
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0);
+}
+
+function isTruthy(raw: string | undefined): boolean {
+    return raw !== undefined && /^(1|true|yes|on)$/i.test(raw.trim());
 }
 
 /**
@@ -84,13 +157,30 @@ function accountUrlFromBaseUrl(baseUrl: string): string {
 }
 
 /**
- * `profile` gets interpolated straight into filesystem paths and a keychain
- * account name below, so this isn't cosmetic — an unvalidated value (e.g.
- * containing `..` or `/`) would be a path-traversal bug.
+ * With `PROTONDRIVE_NEMO_DATA_DIR` set, the default profile uses that
+ * directory itself and every other profile `<dir>/<name>`, so a profile may
+ * not be named after a subdirectory the default profile creates there
+ * (content cache, temp copies, pending uploads): it would be wiped with it.
+ * Every other fixed name in that directory (`daemon.lock`, `daemon.sock`,
+ * `events.json`, `clientUid.json`, `cache-*.sqlite`, `auth-session.gpg`)
+ * contains a dot, which a profile name cannot. Lower-case, matched
+ * case-insensitively.
+ */
+const RESERVED_PROFILE_NAMES = new Set(['tmp', 'blobs', 'pending']);
+
+/**
+ * `profile` gets interpolated straight into filesystem paths below, so this
+ * isn't cosmetic — an unvalidated value (e.g. containing `..` or `/`) would be
+ * a path-traversal bug.
  */
 function validateProfileName(profile: string): void {
     if (!/^[A-Za-z0-9_-]+$/.test(profile)) {
         throw new Error(`Invalid profile name "${profile}": use only letters, digits, "-", "_".`);
+    }
+    if (RESERVED_PROFILE_NAMES.has(profile.toLowerCase())) {
+        throw new Error(
+            `Invalid profile name "${profile}": "${profile}" is reserved (with PROTONDRIVE_NEMO_DATA_DIR set, its directory would be the default account's ${profile.toLowerCase()}/ cache directory).`,
+        );
     }
 }
 

@@ -28,12 +28,24 @@ a real FUSE filesystem, so file-manager integration comes for free.
   (an actively maintained N-API FUSE binding). See
   [Architecture](#architecture) below for how FUSE calls map to Drive API
   calls.
-- **Session storage**: your login session is stored in the OS keychain via
-  `keytar` (libsecret/GNOME Keyring on Linux), under its own service name
-  — separate from Proton's official `proton-drive` CLI, so both can be
-  installed without conflicting. The keychain *account* name is scoped by
-  `--account` (`auth-session` for the default account, `auth-session-<name>`
-  for others) — see [Multiple accounts](#multiple-accounts).
+- **Session storage**: your login session (which unlocks the whole Proton
+  account) is encrypted with GnuPG to the key named by
+  `PROTONDRIVE_NEMO_GPG_RECIPIENT` (a key id, fingerprint or user id) and
+  written to a local file. This store comes from
+  [NioZow/protondrive-fuse](https://github.com/NioZow/protondrive-fuse).
+  Only ciphertext ever touches disk; decryption happens in memory through
+  your `gpg-agent`, so this tool never asks for or holds a passphrase. The
+  agent must therefore be able to use the secret key when you run `login` or
+  `mount` (unlock it beforehand, or have a pinentry available to prompt).
+  - `PROTONDRIVE_NEMO_GPG_RECIPIENT` is **required**: there is no OS
+    keychain and no passphrase fallback, and `login`/`mount` refuse to start
+    without it.
+  - The encrypted session is `auth-session.gpg` in the account's app data
+    dir (`$XDG_DATA_HOME/protondrive-nemo[-<name>]/`), so each `--account`
+    gets its own file — see [Multiple accounts](#multiple-accounts).
+    `PROTONDRIVE_NEMO_CREDENTIALS_FILE` moves the **default** account's
+    file only; any other `--account` ignores it and keeps its own, so a
+    `login --account work` can never overwrite the default session.
 
 ## Requirements
 
@@ -41,22 +53,120 @@ a real FUSE filesystem, so file-manager integration comes for free.
   distros, including Linux Mint, have one of these by default) and
   `libfuse-dev` to build the native binding.
 - Node.js 20+.
-- A Secret Service provider for session storage (GNOME Keyring, which Linux
-  Mint ships by default, or KWallet with the appropriate libsecret backend).
+- GnuPG (`gpg` on `PATH`) with a key you can decrypt with through
+  `gpg-agent` (plus a pinentry if the key has a passphrase), for session
+  storage.
 
 ## Build
 
+Dependencies are installed without running any lifecycle
+script, and only the two native addons, `@cocalc/fuse-native` and
+`better-sqlite3`, are built. No other dependency needs its install script:
+core-js's only prints a banner, exifreader's builds a custom bundle only when
+a project configures one, and esbuild's only verifies the platform binary
+that `npm ci` already installs (and may download one if it is missing).
+
+Before that rebuild, the FUSE binding is patched for
+[fuse-native#3](https://github.com/sagemathinc/fuse-native/issues/3):
+`@cocalc/fuse-native` ≤ 2.4.3 passes the atime where the mtime belongs in
+`utimens`, so every `touch`/`rsync -t`/`cp -p` would set the wrong time. This
+is the same patch `nix/package.nix` applies.
+
 ```bash
-npm install
+npm ci --ignore-scripts
+sed -i '/FUSE_METHOD_VOID(utimens/,/^})/ s/FUSE_UINT64_TO_INTS_ARGV(l->atime, 5)/FUSE_UINT64_TO_INTS_ARGV(l->mtime, 5)/' \
+  node_modules/@cocalc/fuse-native/fuse-native.c
+sed -n '/FUSE_METHOD_VOID(utimens/,/^})/p' node_modules/@cocalc/fuse-native/fuse-native.c   # check: l->mtime, 5
+rm -rf node_modules/@cocalc/fuse-native/build
+npm rebuild @cocalc/fuse-native better-sqlite3 --build-from-source
 npm run build
 ```
 
-This produces `dist/cli.js`. `npm install` needs `libfuse-dev` present to
-compile the native FUSE binding:
+This produces `dist/cli.js`. The rebuild needs a C toolchain, Python and the
+FUSE headers (`libfuse-dev`) found through `pkg-config`:
 
 ```bash
 sudo apt install libfuse-dev   # Debian/Ubuntu/Linux Mint
 ```
+
+`nix develop` (see [Nix](#nix)) provides all of this. When building on NixOS
+outside that shell, point `pkg-config` at `fuse.dev` first:
+
+```bash
+export PKG_CONFIG_PATH="$(nix build --no-link --print-out-paths nixpkgs#fuse.dev)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+```
+
+## Tests
+
+```bash
+npm test
+```
+
+Runs the unit tests in `test/unit/` with Node's built-in test runner, after
+bundling them with esbuild (`test/run.js`). The FUSE binding is replaced by
+an in-memory stand-in (`test/stubs/fuse-native.ts`), so the tests need
+neither `/dev/fuse` nor any native module to be built.
+
+```bash
+npm run test:mount
+```
+
+Mounts the filesystem for real, backed by an in-memory Drive
+(`test/fakeDrive.ts`), and drives it with `rsync`, `cp`, `touch` and `mv`. It
+checks that every file is uploaded once, under its final name, with its own
+modification time. It needs `/dev/fuse`, a setuid `fusermount`, and the native
+binding built with the fuse-native#3 patch as shown under [Build](#build); an
+unpatched binding fails its modification-time checks.
+
+## Nix
+
+The repository is a flake (`nixpkgs` is its only input):
+
+```bash
+nix build              # or: nix build .#protondrive-nemo
+```
+
+This builds `result/bin/protondrive-nemo`, wrapped with `gpg` on its `PATH`.
+The build:
+
+- applies the [fuse-native#3](https://github.com/sagemathinc/fuse-native/issues/3)
+  fix to `@cocalc/fuse-native` (≤ 2.4.3 passes the atime where the mtime
+  belongs in `utimens`, so every `touch`/`rsync -t`/`cp -p` would set the
+  wrong time). A guard fails the build if the patch no longer finds its
+  target line, so a reshaped upstream file can't silently ship the bug; once
+  a fixed release is in the lockfile the patch is a no-op;
+- runs no dependency's lifecycle scripts (`npm rebuild --ignore-scripts`),
+  then builds only the two native addons, `@cocalc/fuse-native` and
+  `better-sqlite3`, from source against Nix's `fuse` and `sqlite`;
+  `prebuild-install` never downloads a prebuilt binary;
+- runs `npm run typecheck` and `npm test` (the tier-1 tests above); the
+  mount tests need `/dev/fuse` and are not run in the sandbox.
+
+For home-manager, import the flake's module and enable it; the options become
+`PROTONDRIVE_NEMO_*` defaults baked into a wrapper (an explicit value in your
+shell still wins):
+
+```nix
+{
+  imports = [ protondrive-nemo.homeManagerModules.default ];
+  programs.protondrive-nemo = {
+    enable = true;
+    gpgRecipient = "0x…";
+  };
+}
+```
+
+Further options: `cachePaths`, `ephemeralCache`, `credentialsFile`,
+`dataDir`, `baseUrl`, `logLevel`, `allowRoot` (needs
+`programs.fuse.userAllowOther = true` in NixOS) and `environment`. No
+service is installed; you start the mount yourself (`protondrive-nemo
+mount`), after `gpg-agent` can decrypt.
+
+`nix develop` gives a shell with Node 22, the build toolchain, `fuse`,
+`sqlite` and `gnupg`.
+
+The flake, package, module and dev shell are adapted from
+[NioZow/protondrive-fuse](https://github.com/NioZow/protondrive-fuse).
 
 ## Usage
 
@@ -71,19 +181,41 @@ In another terminal (or Ctrl+C the `mount` process to unmount):
 node dist/cli.js unmount
 ```
 
+`unmount` asks the running mount daemon to shut down over its control
+socket: uploads still running get the shutdown grace period (see below), the
+rest stay pending and upload on the next `mount`. If no daemon answers (it
+crashed or was killed), `unmount` just detaches the mount it left behind.
+
+Only one mount daemon runs per account: a second `mount` for the same
+account refuses to start (`already running for this account (pid N)`), as
+the two would share one pending-upload journal. The lock is `daemon.lock` in
+the account's cache dir; a lock left by a process that is gone is taken over.
+
 Other commands: `node dist/cli.js status`, `node dist/cli.js logout`.
 
 Add `-m /custom/path` to `mount`/`unmount`/`status`/`evict` to use a
 different mount point than the default `~/ProtonDrive`.
 
-### Run automatically on login
+### Let root use the mount
+
+A FUSE mount is private to the user who mounted it: even root gets
+"Permission denied". To let root use it as well (for example a backup job
+running as root), set `PROTONDRIVE_NEMO_FUSE_ALLOW_ROOT=1` for the `mount`
+command. libfuse accepts this only when `/etc/fuse.conf` contains the line
+`user_allow_other`; without it the mount fails to start.
 
 ```bash
-mkdir -p ~/.config/systemd/user
-ln -s "$(pwd)/systemd/protondrive-nemo.service" ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now protondrive-nemo
+PROTONDRIVE_NEMO_FUSE_ALLOW_ROOT=1 node dist/cli.js mount
 ```
+
+### Starting the mount
+
+Start the mount by hand (`protondrive-nemo mount`, or `node dist/cli.js
+mount`), after `gpg-agent` can use your key: the stored session is
+GPG-encrypted, and a service started at login would run before the agent is
+unlocked (and without `PROTONDRIVE_NEMO_GPG_RECIPIENT`). The units in
+`systemd/` predate the GPG session store and are not supported: they set no
+recipient and run `dist/cli.js` through nvm, so they would restart in a loop.
 
 ### Add a Nemo sidebar shortcut
 
@@ -95,27 +227,24 @@ nemo -q                                    # restart Nemo to pick it up
 ### Multiple accounts
 
 Every command takes `-a, --account <name>` to operate on an isolated
-account profile: its own keychain session, its own cache/app dir
+account profile: its own credentials file, its own cache/app dir
 (`$XDG_CACHE_HOME/protondrive-nemo-<name>`,
 `$XDG_DATA_HOME/protondrive-nemo-<name>`), and its own default mount point
 (`~/ProtonDrive-<name>`). Omitting `--account` (or passing `--account
 default`) is exactly today's single-account behavior — nothing changes for
-an existing install.
+an existing install. The names `tmp`, `blobs` and `pending` (any case) are
+reserved: with `PROTONDRIVE_NEMO_DATA_DIR` set, other accounts live in
+`<dir>/<name>`, beside the default account's cache directories of those
+names.
 
 ```bash
 node dist/cli.js login --account work
 node dist/cli.js mount --account work     # mounts ~/ProtonDrive-work
 ```
 
-To run a second account as an always-on background service alongside the
-default one, use the templated unit — it doesn't touch the existing
-`protondrive-nemo.service`:
-
-```bash
-ln -s "$(pwd)/systemd/protondrive-nemo@.service" ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now protondrive-nemo@work
-```
+Each account's mount is started by hand too (see
+[Starting the mount](#starting-the-mount)); the templated unit
+`systemd/protondrive-nemo@.service` is not supported.
 
 Add its own sidebar bookmark the same way, just pointed at its mount point:
 
@@ -205,6 +334,70 @@ This shows up two ways, since neither is complete on its own:
 nemo -q                                    # restart Nemo to pick it up
 ```
 
+### Limit what is cached
+
+Opening a file downloads its decrypted content to
+`$XDG_CACHE_HOME/protondrive-nemo/blobs/`, and by default it stays there.
+Two environment variables for `mount` narrow that down:
+
+- `PROTONDRIVE_NEMO_CACHE_PATHS`: a comma-separated list of Drive folders
+  whose files may stay cached. Files elsewhere are still fully readable and
+  writable, but their decrypted copy (under `tmp/`) is deleted as soon as the
+  last program using it closes the file (and anything left in `tmp/` by a crash is
+  cleared when the mount starts and stops).
+- `PROTONDRIVE_NEMO_EPHEMERAL_CACHE=1`: keep nothing. Every open uses a
+  throwaway copy, and the whole content cache is wiped when the mount starts
+  and when it stops.
+
+Changes waiting to upload are kept in `pending/` whatever the policy says; once uploaded, a file outside the allowlist is not kept.
+
+```bash
+PROTONDRIVE_NEMO_CACHE_PATHS="/Documents,/Photos" node dist/cli.js mount
+PROTONDRIVE_NEMO_EPHEMERAL_CACHE=1 node dist/cli.js mount
+```
+
+The SDK's metadata cache is unaffected: it is encrypted at rest.
+
+## Timestamps, pending uploads and syncing
+
+Files keep their own modification time: copying onto the mount with
+`cp -p`, `touch -d` or `rsync -t` stores that time with the upload (Proton's
+apps show it too), and the mount reports it back.
+
+A changed file is not uploaded the moment it is closed. It waits until it has
+been quiet for 2 seconds (`PROTONDRIVE_NEMO_SETTLE_MS`), so that the
+`utimensat` and `rename` that tools like rsync issue right after closing are
+part of the same upload, and a file saved over an existing one becomes a new
+revision of it (its history is kept). Until then it lives in `pending/` in the
+cache dir with a journal record, and survives an unmount, a crash or a
+reboot: the next `mount` uploads it. On shutdown the mount gives running
+uploads 10 seconds (`PROTONDRIVE_NEMO_SHUTDOWN_GRACE_MS`) and leaves the rest
+for next time.
+
+- `protondrive-nemo flush` uploads everything pending now and waits; it exits
+  non-zero if anything is still not on Drive.
+- `protondrive-nemo status` shows pending and failed uploads.
+- If a file changed on Drive since you changed it here, or a file with the
+  same name appeared, your version is kept beside it as
+  `name (conflict YYYY-MM-DD HHMM).ext`. Nothing is overwritten silently.
+
+Drive has no permissions or owners, so `chmod` and `chown` fail with
+"Operation not permitted". Sync with
+
+```bash
+rsync -rlt SRC/ ~/ProtonDrive/DEST/
+```
+
+(or `rsync -a --no-perms --no-owner --no-group`). Plain `rsync -a` copies
+nothing: rsync gives up on each file when it cannot set its permissions, and
+exits with code 23. Setting the time of a file that is already
+uploaded (e.g. `touch -d` on it) succeeds but has no effect: Drive can only
+store a new time together with new content.
+
+Keeping modification times needs `@cocalc/fuse-native` with the fix for
+[issue #3](https://github.com/sagemathinc/fuse-native/issues/3); see
+[Tests](#tests).
+
 ## Architecture
 
 ```
@@ -212,10 +405,15 @@ src/cli.ts              commander CLI: login, logout, status, mount, unmount
 src/mount.ts             wires DriveTree + ContentStore + FUSE ops into a Fuse instance
 src/fuseOps.ts            FUSE syscall handlers (getattr, readdir, read, write, ...)
 src/driveTree.ts          FUSE path <-> Drive node UID resolution + short-lived directory-listing cache
-src/contentStore.ts        local blob cache: download-on-open, upload-on-release
-src/ipcServer.ts            Unix-socket control channel for the `evict` CLI command
-                            and the cache-status Nemo extension to talk to the
-                            running mount daemon
+src/contentStore.ts        local blob cache: download-on-open
+src/cachePolicy.ts         decides which paths may stay in the local cache (allowlist / ephemeral)
+src/pendingUploads.ts      changes not on Drive yet: settle window, conflicts, retries, shutdown
+src/pendingJournal.ts      durable per-upload records beside their content (pending/)
+src/ipcServer.ts            Unix-socket control channel to the running mount daemon:
+                            `evict`, the cache-status Nemo extension (`cacheStatus`),
+                            and `flush`, `pendingStatus` (`status`) and `shutdown` (`unmount`)
+src/shutdown.ts             the daemon's one guarded shutdown (signals and `unmount`)
+src/instanceLock.ts         one mount daemon per account (`daemon.lock`)
 nemo-extension/             nemo-python extension: cache-status emblem + list-view
                             column (see install-nemo-cache-emblems.sh)
 src/sdk-bootstrap/         bootstraps @protontech/drive-sdk's ProtonDriveClient:
@@ -229,11 +427,18 @@ src/types/stubs/           tsc-only type stand-ins for @protontech/crypto — se
 
 Content model: opening a file downloads it in full to a local cache
 (`$XDG_CACHE_HOME/protondrive-nemo/blobs/`, decrypted) before any byte is
-readable, and a dirty file is re-uploaded as a new revision on close. This
+readable, and a changed file is uploaded as a new revision once it has settled (see
+[Timestamps, pending uploads and syncing](#timestamps-pending-uploads-and-syncing)). This
 is simple and reliable but means very large files are slower to open than a
 true byte-range/streaming implementation would be — a reasonable v1
 tradeoff given Proton's own SDK doesn't yet ship a sync module to build a
 smarter cache on top of (see [VENDOR.md](VENDOR.md)).
+
+The cached copies are decrypted, so they are kept owner-only: `blobs/` is
+mode 0700 and every file in it is created 0600, whatever the umask. A `blobs/`
+directory left by an older version is tightened to 0700 the first time a file
+is cached. The cache and data directories themselves are created 0700 when
+they don't exist yet; an existing one keeps its mode.
 
 Directory listings are cached in memory per folder for 10 seconds to avoid
 re-iterating a folder's children on every single FUSE `getattr`/`readdir`
@@ -245,8 +450,8 @@ immediately, so your own changes always show up right away.
 
 - Only "My Files" is exposed — no Trash, Devices, Shared-with-me, or Photos.
 - No true streaming: large file opens download the whole file first.
-- No conflict handling beyond what the SDK itself does — this isn't a
-  background sync engine, just a live view.
+- Conflicts are detected only for files changed through this mount (they
+  become conflict copies); it isn't a background sync engine, just a live view.
 - No Nemo-specific extras yet (sync-status emblems, "copy share link" in the
   right-click menu). Since this is a real mount, basic file operations don't
   need them; they're a natural follow-up built on the SDK's sharing API.

@@ -1,9 +1,8 @@
-import { mkdir } from 'node:fs/promises';
-
 import { CryptoProxy } from '@protontech/crypto';
 import { Api as CryptoApi } from '@protontech/crypto/proxy/endpoint/api.ts';
 import { Logger, OpenPGPCryptoWithCryptoProxy, ProtonDriveClient } from '@protontech/drive-sdk';
 
+import { mkdirPrivate } from '../privateDirs';
 import { initApi } from './api';
 import { createCaches } from './cache';
 import { getOrGenerateClientUid } from './clientUid';
@@ -23,12 +22,13 @@ import { ConsoleLogger } from './logger';
  */
 export async function initDrive(configOptions: InitConfig) {
     const config = getConfig(configOptions);
-    await Promise.all([mkdir(config.cacheDir, { recursive: true }), mkdir(config.appDir, { recursive: true })]);
+    // Owner-only when created here; an existing directory keeps its mode.
+    await Promise.all([mkdirPrivate(config.cacheDir), mkdirPrivate(config.appDir)]);
 
     const logger: Logger = new ConsoleLogger(config.logLevel);
 
     const openPGPCryptoModule = initOpenPGPCryptoModule();
-    const credentials = initCredentials(config.profile, logger);
+    const credentials = initCredentials(config, logger);
     const { auth, addresses, srp, apiClient, httpClient } = await initApi(config, credentials, logger, CryptoProxy);
 
     const clientUid = await getOrGenerateClientUid(config, logger);

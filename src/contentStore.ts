@@ -1,9 +1,11 @@
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, rm, stat } from 'node:fs/promises';
+import { rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { Readable, Writable } from 'node:stream';
 
 import type { Logger, NodeEntity, ProtonDriveClient } from '@protontech/drive-sdk';
+
+import { ensurePrivateDir } from './privateDirs';
 
 const MEDIA_TYPES: Record<string, string> = {
     '.txt': 'text/plain',
@@ -23,91 +25,160 @@ const MEDIA_TYPES: Record<string, string> = {
     '.html': 'text/html',
 };
 
+/**
+ * Cached blobs are decrypted file content, so they are owner-only, inside an
+ * owner-only (0700) directory. The mode applies only when a file is created:
+ * a blob left by an older version keeps 0644, but once its directory is 0700
+ * no other user can reach it.
+ */
+const BLOB_MODE = 0o600;
+
 function guessMediaType(name: string): string {
     return MEDIA_TYPES[path.extname(name).toLowerCase()] ?? 'application/octet-stream';
 }
 
+export interface UploadOptions {
+    /** Claimed modification time, stored (encrypted) with the revision. */
+    modificationTime: Date;
+    /** Cancels both the wait for a slot in the SDK's upload queue and the upload itself. */
+    signal?: AbortSignal;
+}
+
 /**
  * Materializes Drive file content to local disk on demand (download on
- * first open, upload on release-if-dirty), instead of implementing
+ * first open; changes are uploaded through pendingUploads.ts), instead of implementing
  * byte-range paging against the remote. Simple and reliable for a v1; the
  * tradeoff is that opening a very large file downloads it in full before
  * any byte is readable — see README limitations.
+ *
+ * Content lives under two directories: `blobs/` (persistent, reused across
+ * opens) and `tmp/` (throwaway, removed on close). The mount's cache policy
+ * decides which one a given file uses; `wipe()` clears both.
  */
 export class ContentStore {
+    private readonly persistentDir: string;
+    private readonly ephemeralDir: string;
+
     constructor(
         private readonly sdk: ProtonDriveClient,
-        private readonly cacheDir: string,
+        cacheRootDir: string,
         private readonly logger: Logger,
-    ) {}
-
-    localPathFor(nodeUid: string): string {
-        return path.join(this.cacheDir, encodeURIComponent(nodeUid));
+    ) {
+        this.persistentDir = path.join(cacheRootDir, 'blobs');
+        this.ephemeralDir = path.join(cacheRootDir, 'tmp');
     }
 
-    /** Whether a file's content is already fully downloaded locally (same freshness check `ensureDownloaded` uses). */
+    private dirFor(ephemeral: boolean): string {
+        return ephemeral ? this.ephemeralDir : this.persistentDir;
+    }
+
+    localPathFor(nodeUid: string, ephemeral = false): string {
+        return path.join(this.dirFor(ephemeral), encodeURIComponent(nodeUid));
+    }
+
+    /** Whether a file's persistent content is already fully downloaded locally (same freshness check `ensureDownloaded` uses). */
     async isCached(node: NodeEntity): Promise<boolean> {
-        const localPath = this.localPathFor(node.uid);
+        return this.isComplete(node, this.persistentDir);
+    }
+
+    private async isComplete(node: NodeEntity, dir: string): Promise<boolean> {
+        const localPath = path.join(dir, encodeURIComponent(node.uid));
         const expectedSize = node.activeRevision?.claimedSize;
         const existing = await stat(localPath).catch(() => undefined);
         return !!existing && (expectedSize === undefined || existing.size === expectedSize);
     }
 
-    async ensureDownloaded(node: NodeEntity): Promise<string> {
-        const localPath = this.localPathFor(node.uid);
+    /** Downloads `node` if needed and returns the local path. `ephemeral` sends the copy to the throwaway directory. */
+    async ensureDownloaded(node: NodeEntity, opts: { ephemeral?: boolean } = {}): Promise<string> {
+        const dir = this.dirFor(!!opts.ephemeral);
 
-        if (await this.isCached(node)) {
-            return localPath;
+        if (!opts.ephemeral && (await this.isCached(node))) {
+            return path.join(dir, encodeURIComponent(node.uid));
+        }
+        if (opts.ephemeral && (await this.isComplete(node, dir))) {
+            return path.join(dir, encodeURIComponent(node.uid));
         }
 
-        await mkdir(this.cacheDir, { recursive: true });
+        const localPath = path.join(dir, encodeURIComponent(node.uid));
+        await ensurePrivateDir(dir);
         this.logger.debug(`Downloading ${node.uid} to ${localPath}`);
         const downloader = await this.sdk.getFileDownloader(node.uid);
-        const nodeWriteStream = createWriteStream(localPath);
+        const nodeWriteStream = createWriteStream(localPath, { mode: BLOB_MODE });
         const controller = downloader.downloadToStream(Writable.toWeb(nodeWriteStream));
         await controller.completion();
         return localPath;
     }
 
-    createEmptyLocal(nodeUid: string): Promise<string> {
-        const localPath = this.localPathFor(nodeUid);
-        return mkdir(this.cacheDir, { recursive: true })
+    createEmptyLocal(nodeUid: string, opts: { ephemeral?: boolean } = {}): Promise<string> {
+        const ephemeral = !!opts.ephemeral;
+        const localPath = this.localPathFor(nodeUid, ephemeral);
+        return ensurePrivateDir(this.dirFor(ephemeral))
             .then(() => new Promise<void>((resolve, reject) => {
-                const ws = createWriteStream(localPath);
+                const ws = createWriteStream(localPath, { mode: BLOB_MODE });
                 ws.end(() => resolve());
                 ws.on('error', reject);
             }))
             .then(() => localPath);
     }
 
+    /** Removes a node's local copy from both the persistent and the throwaway cache. */
     async forget(nodeUid: string): Promise<void> {
-        await rm(this.localPathFor(nodeUid), { force: true });
+        await Promise.all([
+            rm(this.localPathFor(nodeUid, false), { force: true }),
+            rm(this.localPathFor(nodeUid, true), { force: true }),
+        ]);
     }
 
-    async uploadNewFile(parentUid: string, name: string, localPath: string): Promise<NodeEntity> {
+    /** Deletes the throwaway copy of `nodeUid`, if any (the persistent cache is not touched). */
+    async forgetEphemeral(nodeUid: string): Promise<void> {
+        await rm(this.localPathFor(nodeUid, true), { force: true });
+    }
+
+    /**
+     * Deletes the throwaway cache (tmp/). Its copies only live while a file
+     * is open, so anything there at mount start or after unmount is a
+     * leftover (crash, SIGKILL, lazy unmount).
+     */
+    async wipeEphemeral(): Promise<void> {
+        this.logger.debug(`Wiping throwaway content cache under ${this.ephemeralDir}`);
+        await rm(this.ephemeralDir, { recursive: true, force: true });
+    }
+
+    /** Deletes every cached blob (persistent and throwaway). Used by the ephemeral-cache mode. */
+    async wipe(): Promise<void> {
+        this.logger.debug(`Wiping content cache under ${this.persistentDir} and ${this.ephemeralDir}`);
+        await Promise.all([
+            rm(this.persistentDir, { recursive: true, force: true }),
+            rm(this.ephemeralDir, { recursive: true, force: true }),
+        ]);
+    }
+
+    async uploadNewFile(parentUid: string, name: string, localPath: string, options: UploadOptions): Promise<NodeEntity> {
         const size = (await stat(localPath)).size;
-        const uploader = await this.sdk.getFileUploader(parentUid, name, {
-            mediaType: guessMediaType(name),
-            expectedSize: size,
-            modificationTime: new Date(),
-        });
+        const uploader = await this.sdk.getFileUploader(
+            parentUid,
+            name,
+            { mediaType: guessMediaType(name), expectedSize: size, modificationTime: options.modificationTime },
+            options.signal,
+        );
+        // Opened only now: getFileUploader waits for a slot in the SDK's upload queue.
         const stream = Readable.toWeb(createReadStream(localPath)) as ReadableStream;
         const controller = await uploader.uploadFromStream(stream, []);
         const { nodeUid } = await controller.completion();
         return this.sdk.getNode(nodeUid);
     }
 
-    async uploadRevision(node: NodeEntity, localPath: string): Promise<void> {
+    /** Uploads a new revision of `nodeUid`; resolves with the new revision's uid. */
+    async uploadRevision(nodeUid: string, name: string, localPath: string, options: UploadOptions): Promise<string> {
         const size = (await stat(localPath)).size;
-        const uploader = await this.sdk.getFileRevisionUploader(node.uid, {
-            mediaType: guessMediaType(node.name.ok ? node.name.value : ''),
-            expectedSize: size,
-            modificationTime: new Date(),
-        });
+        const uploader = await this.sdk.getFileRevisionUploader(
+            nodeUid,
+            { mediaType: guessMediaType(name), expectedSize: size, modificationTime: options.modificationTime },
+            options.signal,
+        );
         const stream = Readable.toWeb(createReadStream(localPath)) as ReadableStream;
         const controller = await uploader.uploadFromStream(stream, []);
-        await controller.completion();
-        // Re-download disabled: the local file we just uploaded from is
-        // already the authoritative content, no need to round-trip it.
+        const { nodeRevisionUid } = await controller.completion();
+        return nodeRevisionUid;
     }
 }
