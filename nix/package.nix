@@ -38,7 +38,7 @@ buildNpmPackage {
 
   # Hash of the npm dependency tree; refresh with:
   #   nix run nixpkgs#prefetch-npm-deps -- package-lock.json
-  npmDepsHash = "sha256-zmGQkSqRrNxHXyoTvw56scsh2mLmnLoIbd5zlTFLFoM=";
+  npmDepsHash = "sha256-wB2z0s4HReBMyPxl/z1Wn89pXMjnVw7UxBWktugVzjA=";
 
   # No dependency's lifecycle scripts run (core-js, exifreader, esbuild
   # postinstalls); only the two native addons are built, below.
