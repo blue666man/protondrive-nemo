@@ -93,7 +93,7 @@ program
     .action(async (opts: { account?: string; mountPoint?: string }) => {
         const mountPoint = opts.mountPoint ?? defaultMountPointFor(opts.account);
         const d = await drive(opts.account);
-        const { fuse, ipc } = await mount(d, mountPoint);
+        const { fuse, ipc, cleanup } = await mount(d, mountPoint);
         console.log(`Mounted Proton Drive at ${mountPoint}`);
 
         const shutdown = async () => {
@@ -103,6 +103,7 @@ program
                 if (err) console.error('Unmount failed:', err);
                 resolve();
             }));
+            await cleanup();
             await d.dispose();
             process.exit(0);
         };

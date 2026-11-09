@@ -12,6 +12,19 @@ export interface InitConfig {
     enablePersistedEvents?: boolean;
     /** Account profile, isolating keychain entry, cache/app dirs, and default mount point. Defaults to `'default'`. */
     profile?: string;
+    /**
+     * Remote folder paths whose files may be kept in the persistent local
+     * cache. Overrides `PROTONDRIVE_NEMO_CACHE_PATHS` (comma-separated). Empty
+     * means every file is cacheable, which is the default.
+     */
+    cachePaths?: string[];
+    /**
+     * When true, decrypted file content is never kept on disk: every open is
+     * downloaded to a temporary location and removed again, and the whole
+     * content cache is wiped on start and on exit. Overrides
+     * `PROTONDRIVE_NEMO_EPHEMERAL_CACHE`. Defaults to false.
+     */
+    ephemeralCache?: boolean;
 }
 
 export interface Config {
@@ -39,6 +52,19 @@ export interface Config {
     enablePersistedEvents: boolean;
     /** Level of logging to the console. */
     logLevel: LogLevel;
+
+    /**
+     * Remote folder paths (POSIX-style, under "My Files") whose files may be
+     * kept in the persistent local cache. Empty = every file may be cached.
+     * Files outside these folders are still readable, but their decrypted copy
+     * is removed as soon as it is closed.
+     */
+    cachePaths: string[];
+    /**
+     * When true, no decrypted content is ever kept: every open uses a
+     * throwaway copy and the content cache is wiped on start and exit.
+     */
+    ephemeralCache: boolean;
 }
 
 /**
@@ -57,6 +83,9 @@ export function getConfig(options: InitConfig): Config {
 
     const baseUrl = process.env.PROTONDRIVE_NEMO_BASE_URL || 'drive-api.proton.me';
 
+    const cachePaths = options.cachePaths ?? parsePathList(process.env.PROTONDRIVE_NEMO_CACHE_PATHS);
+    const ephemeralCache = options.ephemeralCache ?? isTruthy(process.env.PROTONDRIVE_NEMO_EPHEMERAL_CACHE);
+
     return {
         profile,
         clientUidPrefix: options.clientUidPrefix,
@@ -69,7 +98,24 @@ export function getConfig(options: InitConfig): Config {
         appDir,
         enablePersistedEvents: options.enablePersistedEvents ?? true,
         logLevel,
+        cachePaths,
+        ephemeralCache,
     };
+}
+
+/** Parses `PROTONDRIVE_NEMO_CACHE_PATHS`: a comma- or colon-separated list of Drive folder paths. */
+function parsePathList(raw: string | undefined): string[] {
+    if (!raw) {
+        return [];
+    }
+    return raw
+        .split(/[,:]/)
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0);
+}
+
+function isTruthy(raw: string | undefined): boolean {
+    return raw !== undefined && /^(1|true|yes|on)$/i.test(raw.trim());
 }
 
 /**

@@ -29,7 +29,7 @@ function mode(p: string): string {
 
 test('createEmptyLocal creates the blob dir 0700 and the blob 0600', async () => {
     const blobs = path.join(tmp.dir, 'blobs');
-    const store = new ContentStore({} as ProtonDriveClient, blobs, silentLogger);
+    const store = new ContentStore({} as ProtonDriveClient, tmp.dir, silentLogger);
 
     const local = await store.createEmptyLocal('pending:/new.txt');
 
@@ -37,9 +37,18 @@ test('createEmptyLocal creates the blob dir 0700 and the blob 0600', async () =>
     assert.equal(mode(local), '600');
 });
 
+test('an ephemeral createEmptyLocal creates tmp/ 0700', async () => {
+    const store = new ContentStore({} as ProtonDriveClient, tmp.dir, silentLogger);
+
+    const local = await store.createEmptyLocal('pending:/new.txt', { ephemeral: true });
+
+    assert.equal(mode(path.join(tmp.dir, 'tmp')), '700');
+    assert.equal(mode(local), '600');
+});
+
 test('ensureDownloaded writes the decrypted blob 0600 in a 0700 dir', async () => {
     const blobs = path.join(tmp.dir, 'blobs');
-    const store = new ContentStore(downloadingSdk('secret'), blobs, silentLogger);
+    const store = new ContentStore(downloadingSdk('secret'), tmp.dir, silentLogger);
 
     const local = await store.ensureDownloaded(fileNode('node-1', 6));
 
@@ -52,7 +61,7 @@ test('an existing world-readable blob dir is tightened to 0700', async () => {
     mkdirSync(blobs);
     chmodSync(blobs, 0o755);
     writeFileSync(path.join(blobs, 'old'), 'plaintext from an older version', { mode: 0o644 });
-    const store = new ContentStore({} as ProtonDriveClient, blobs, silentLogger);
+    const store = new ContentStore({} as ProtonDriveClient, tmp.dir, silentLogger);
 
     await store.createEmptyLocal('pending:/new.txt');
 
