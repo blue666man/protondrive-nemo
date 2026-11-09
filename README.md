@@ -4,8 +4,6 @@ An unofficial FUSE mount of [Proton Drive](https://proton.me/drive) for
 Linux Mint's Nemo file manager (and any other file manager, since it's a
 real mountpoint — Nautilus, Thunar, Dolphin, etc. all work too).
 
-> This is the `encephalon` deployment branch: see [ENCEPHALON.md](ENCEPHALON.md).
-
 > **This is a third-party application, not officially supported by Proton.**
 > It is not affiliated with, endorsed by, or connected to Proton AG. It is
 > built on Proton's official, MIT-licensed [Drive SDK](https://github.com/ProtonDriveApps/sdk),
@@ -61,7 +59,7 @@ a real FUSE filesystem, so file-manager integration comes for free.
 
 ## Build
 
-On this branch dependencies are installed without running any lifecycle
+Dependencies are installed without running any lifecycle
 script, and only the two native addons, `@cocalc/fuse-native` and
 `better-sqlite3`, are built. No other dependency needs its install script:
 core-js's only prints a banner, exifreader's builds a custom bundle only when
@@ -212,13 +210,12 @@ PROTONDRIVE_NEMO_FUSE_ALLOW_ROOT=1 node dist/cli.js mount
 
 ### Starting the mount
 
-On this branch the mount is started by hand (`protondrive-nemo mount`, or
-`node dist/cli.js mount`), after `gpg-agent` can use your key: the stored
-session is GPG-encrypted, and a service started at login would run before the
-agent is unlocked (and without `PROTONDRIVE_NEMO_GPG_RECIPIENT`). The units in
-`systemd/` are kept for the upstream keytar setup and are not supported here:
-they set no recipient and run `dist/cli.js` through nvm, so they would
-restart in a loop.
+Start the mount by hand (`protondrive-nemo mount`, or `node dist/cli.js
+mount`), after `gpg-agent` can use your key: the stored session is
+GPG-encrypted, and a service started at login would run before the agent is
+unlocked (and without `PROTONDRIVE_NEMO_GPG_RECIPIENT`). The units in
+`systemd/` predate the GPG session store and are not supported: they set no
+recipient and run `dist/cli.js` through nvm, so they would restart in a loop.
 
 ### Add a Nemo sidebar shortcut
 
@@ -247,7 +244,7 @@ node dist/cli.js mount --account work     # mounts ~/ProtonDrive-work
 
 Each account's mount is started by hand too (see
 [Starting the mount](#starting-the-mount)); the templated unit
-`systemd/protondrive-nemo@.service` is not supported on this branch.
+`systemd/protondrive-nemo@.service` is not supported.
 
 Add its own sidebar bookmark the same way, just pointed at its mount point:
 

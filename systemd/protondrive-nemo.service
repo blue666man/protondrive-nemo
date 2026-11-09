@@ -1,8 +1,8 @@
-# Not supported on the `encephalon` branch: the session there is
+# Not supported: the stored session is
 # GPG-encrypted, so start the mount by hand (`protondrive-nemo mount`) after
 # gpg-agent is unlocked. This unit sets no PROTONDRIVE_NEMO_GPG_RECIPIENT,
 # starts at login before the agent is unlocked and runs dist/cli.js through
-# nvm, not the Nix package; it is kept for the upstream keytar setup.
+# nvm, not the Nix package; it predates the GPG session store.
 [Unit]
 Description=Proton Drive FUSE mount (unofficial)
 Documentation=https://github.com/ProtonDriveApps/sdk
